@@ -102,6 +102,30 @@ def load_daily_spend(month_start: date) -> pd.DataFrame:
     df["date_day"] = pd.to_datetime(df["date_day"]).dt.date
     return df
 
+@st.cache_data(ttl=3600)
+def load_daily_spend_by_channel(month_start: date) -> pd.DataFrame:
+    """Get daily spend for the given month, broken out by platform."""
+    query = f"""
+    SELECT
+        date_day,
+        platform,
+        ROUND(SUM(spend), 2) AS daily_spend
+    FROM `{BIGQUERY_TABLE}`
+    WHERE date_day >= @month_start
+      AND date_day <= CURRENT_DATE()
+    GROUP BY date_day, platform
+    ORDER BY date_day, platform
+    """
+    job_config = bigquery.QueryJobConfig(
+        query_parameters=[
+            bigquery.ScalarQueryParameter("month_start", "DATE", month_start),
+        ]
+    )
+    client = get_bq_client()
+    df = client.query(query, job_config=job_config).to_dataframe(create_bqstorage_client=False)
+    df["date_day"] = pd.to_datetime(df["date_day"]).dt.date
+    return df
+
 # Main app
 today = date.today()
 month_start = today.replace(day=1)
@@ -261,3 +285,83 @@ fig.update_layout(
 )
 
 st.plotly_chart(fig, use_container_width=True)
+
+# Channel breakdown
+st.divider()
+st.subheader(f"Channel breakdown, {today.strftime('%B %Y')}")
+
+try:
+    channel_df = load_daily_spend_by_channel(month_start)
+except Exception as e:
+    st.error(f"Could not load channel spend from BigQuery: {type(e).__name__}: {e}")
+    st.stop()
+
+# Map raw platform names from BigQuery to display groups.
+# Microsoft and Reddit get lumped into "Other" because their combined
+# spend is a rounding error against LinkedIn and Google.
+CHANNEL_GROUPS = {
+    "linkedin_ads": "LinkedIn",
+    "google_ads": "Google",
+    "microsoft_ads": "Other",
+    "reddit_ads": "Other",
+}
+channel_df["channel_group"] = channel_df["platform"].map(CHANNEL_GROUPS).fillna("Other")
+
+# Pre-aggregate each group's daily totals once, so the tab rendering is fast.
+grouped = channel_df.groupby(["date_day", "channel_group"], as_index=False)["daily_spend"].sum()
+
+
+def render_channel_view(channel_name: str, channel_data: pd.DataFrame, color: str) -> None:
+    """Render a small pacing tile and a daily chart for one channel group."""
+    if channel_data.empty:
+        st.info(f"No spend recorded for {channel_name} this month yet.")
+        return
+
+    mtd = channel_data["daily_spend"].sum()
+    share_of_total = mtd / mtd_spend if mtd_spend else 0
+    last_7_days_cutoff = today - pd.Timedelta(days=7)
+    recent = channel_data[channel_data["date_day"] >= last_7_days_cutoff]
+    avg_daily_7d = recent["daily_spend"].sum() / 7 if len(recent) else 0
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric(f"{channel_name} MTD", f"${mtd:,.0f}")
+    c2.metric("Share of total spend", f"{share_of_total:.0%}")
+    c3.metric("Avg daily (last 7d)", f"${avg_daily_7d:,.0f}")
+
+    ch_fig = go.Figure()
+    ch_fig.add_trace(go.Bar(
+        x=channel_data["date_day"],
+        y=channel_data["daily_spend"],
+        name=channel_name,
+        marker_color=color,
+    ))
+    ch_fig.update_layout(
+        height=300,
+        margin=dict(l=40, r=40, t=20, b=40),
+        yaxis=dict(title="Daily spend ($)"),
+        xaxis=dict(title=None),
+        bargap=0.2,
+        showlegend=False,
+    )
+    st.plotly_chart(ch_fig, use_container_width=True)
+
+
+tab_total, tab_linkedin, tab_google, tab_other = st.tabs(
+    ["Total", "LinkedIn", "Google", "Other"]
+)
+
+with tab_total:
+    total_daily = grouped.groupby("date_day", as_index=False)["daily_spend"].sum()
+    render_channel_view("Total", total_daily, "#0047FF")
+
+with tab_linkedin:
+    li_daily = grouped[grouped["channel_group"] == "LinkedIn"]
+    render_channel_view("LinkedIn", li_daily, "#0A66C2")
+
+with tab_google:
+    gg_daily = grouped[grouped["channel_group"] == "Google"]
+    render_channel_view("Google", gg_daily, "#34A853")
+
+with tab_other:
+    other_daily = grouped[grouped["channel_group"] == "Other"]
+    render_channel_view("Other (Microsoft + Reddit)", other_daily, "#888888")
