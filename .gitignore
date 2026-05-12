@@ -1,0 +1,17 @@
+# Python virtual environment
+venv/
+
+# Python bytecode
+__pycache__/
+*.pyc
+
+# Local config and credentials
+.env
+*.json
+!sample.json
+
+# Mac stuff
+.DS_Store
+
+# IDE
+.vscode/
