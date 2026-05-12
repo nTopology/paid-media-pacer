@@ -20,6 +20,21 @@ GCP_PROJECT = "bi-ntop"
 BIGQUERY_TABLE = "bi-ntop.aero_prod_ad_reporting.ad_reporting__account_report"
 BUDGET_SHEET_ID = "1D2yoATTH8fY9XrooHUs_pj4meVJFGQqqTCgkj5mqHL4"
 
+CAMPAIGN_TABLE = "bi-ntop.aero_prod_ad_reporting.ad_reporting__campaign_report"
+
+# Campaign category rules from saved category mapping.
+# Maps exact campaign name (LinkedIn) to bucket weights (strategic_share, hv_share).
+
+
+# Google Ads rules: named overrides plus a default for everything else.
+GOOGLE_CATEGORY_RULES = {
+    "Non-Brand_Video_Clicks_Observation_Q22025-Geos_MaxConv": (1.0, 0.0),
+    "Brand_Search_Conversion_Observation_Q22025-Geos_MaxConv_Legacy": (0.7, 0.3),
+    "Non-Brand_Search_Conversions_Observation_Q22025-Geos_MaxConv_032825": (0.7, 0.3),
+    "PMAX_Google Properties_Conversion_Customer-Match_Q22025-Geos_MaxConv_100825": (0.7, 0.3),
+}
+GOOGLE_DEFAULT = (0.0, 1.0)  # Any other Google campaign with spend = 100% HV
+
 
 # Page setup
 st.set_page_config(page_title="Paid Media Pacer", layout="wide")
@@ -115,6 +130,55 @@ def load_daily_spend_by_channel(month_start: date) -> pd.DataFrame:
       AND date_day <= CURRENT_DATE()
     GROUP BY date_day, platform
     ORDER BY date_day, platform
+    """
+    job_config = bigquery.QueryJobConfig(
+        query_parameters=[
+            bigquery.ScalarQueryParameter("month_start", "DATE", month_start),
+        ]
+    )
+    client = get_bq_client()
+    df = client.query(query, job_config=job_config).to_dataframe(create_bqstorage_client=False)
+    df["date_day"] = pd.to_datetime(df["date_day"]).dt.date
+    return df
+
+@st.cache_data(ttl=3600)
+def load_mtd_campaign_spend(month_start: date) -> pd.DataFrame:
+    """Get MTD spend per campaign, with platform info, for bucketing."""
+    query = f"""
+    SELECT
+        platform,
+        campaign_name,
+        ROUND(SUM(spend), 2) AS spend
+    FROM `{CAMPAIGN_TABLE}`
+    WHERE date_day >= @month_start
+      AND date_day <= CURRENT_DATE()
+      AND spend > 0
+    GROUP BY platform, campaign_name
+    ORDER BY spend DESC
+    """
+    job_config = bigquery.QueryJobConfig(
+        query_parameters=[
+            bigquery.ScalarQueryParameter("month_start", "DATE", month_start),
+        ]
+    )
+    client = get_bq_client()
+    return client.query(query, job_config=job_config).to_dataframe(create_bqstorage_client=False)
+
+@st.cache_data(ttl=3600)
+def load_daily_campaign_spend(month_start: date) -> pd.DataFrame:
+    """Daily campaign spend for the month, for the Strategic vs HV trend chart."""
+    query = f"""
+    SELECT
+        date_day,
+        platform,
+        campaign_name,
+        ROUND(SUM(spend), 2) AS spend
+    FROM `{CAMPAIGN_TABLE}`
+    WHERE date_day >= @month_start
+      AND date_day <= CURRENT_DATE()
+      AND spend > 0
+    GROUP BY date_day, platform, campaign_name
+    ORDER BY date_day
     """
     job_config = bigquery.QueryJobConfig(
         query_parameters=[
@@ -398,3 +462,120 @@ with tab_google:
 with tab_other:
     other_daily = grouped[grouped["channel_group"] == "Other"]
     render_channel_view("Other (Microsoft + Reddit)", other_daily, "#888888")
+
+  # Strategic vs High Velocity split
+st.divider()
+st.subheader(f"Strategic vs High Velocity, {today.strftime('%B %Y')}")
+
+try:
+    campaign_df = load_mtd_campaign_spend(month_start)
+    daily_campaign_df = load_daily_campaign_spend(month_start)
+except Exception as e:
+    st.error(f"Could not load campaign spend from BigQuery: {type(e).__name__}: {e}")
+    st.stop()
+
+
+def categorize_campaign(platform: str, campaign_name: str):
+    """Return (strategic_share, hv_share, is_unmatched)."""
+    name_lower = (campaign_name or "").lower()
+    if platform == "linkedin_ads":
+        if "tier" in name_lower:
+            return (1.0, 0.0, False)
+        if "high-velo" in name_lower or "high velo" in name_lower:
+            return (0.0, 1.0, False)
+        return (0.0, 0.0, True)
+    if platform == "google_ads":
+        weights = GOOGLE_CATEGORY_RULES.get(campaign_name, GOOGLE_DEFAULT)
+        return (weights[0], weights[1], False)
+    return (0.0, 1.0, False)
+
+
+def bucket_row(row) -> pd.Series:
+    spend = row["spend"]
+    s, h, unmatched = categorize_campaign(row["platform"], row["campaign_name"])
+    if unmatched:
+        return pd.Series({"strategic": 0.0, "hv": 0.0, "unmatched": spend})
+    return pd.Series({"strategic": spend * s, "hv": spend * h, "unmatched": 0.0})
+
+
+bucketed = campaign_df.join(campaign_df.apply(bucket_row, axis=1))
+strategic_total = bucketed["strategic"].sum()
+hv_total = bucketed["hv"].sum()
+unmatched_total = bucketed["unmatched"].sum()
+bucket_grand_total = strategic_total + hv_total + unmatched_total
+
+sc1, sc2, sc3 = st.columns(3)
+sc1.metric(
+    "Strategic MTD",
+    f"${strategic_total:,.0f}",
+    f"{strategic_total / bucket_grand_total:.0%} of categorized" if bucket_grand_total else "—",
+)
+sc2.metric(
+    "High Velocity MTD",
+    f"${hv_total:,.0f}",
+    f"{hv_total / bucket_grand_total:.0%} of categorized" if bucket_grand_total else "—",
+)
+sc3.metric(
+    "Unmatched",
+    f"${unmatched_total:,.0f}",
+    "Needs a rule" if unmatched_total > 0 else "All matched",
+    delta_color="inverse",
+)
+
+# Snapshot mix as text (donut is bad for lopsided splits)
+mix_total = strategic_total + hv_total
+if mix_total:
+    strat_pct = strategic_total / mix_total
+    hv_pct = hv_total / mix_total
+    st.markdown(
+        f"**Current mix:** Strategic is **{strat_pct:.0%}** of categorized spend "
+        f"(\\${strategic_total:,.0f}), High Velocity is **{hv_pct:.0%}** "
+        f"(\\${hv_total:,.0f})."
+    )
+
+# Trended daily stacked bars: how the mix is shifting over the month
+daily_bucketed = daily_campaign_df.join(daily_campaign_df.apply(bucket_row, axis=1))
+daily_agg = daily_bucketed.groupby("date_day", as_index=False)[
+    ["strategic", "hv", "unmatched"]
+].sum()
+
+trend_fig = go.Figure()
+trend_fig.add_trace(go.Bar(
+    x=daily_agg["date_day"], y=daily_agg["strategic"],
+    name="Strategic", marker_color="#0047FF",
+))
+trend_fig.add_trace(go.Bar(
+    x=daily_agg["date_day"], y=daily_agg["hv"],
+    name="High Velocity", marker_color="#F5A623",
+))
+if daily_agg["unmatched"].sum() > 0:
+    trend_fig.add_trace(go.Bar(
+        x=daily_agg["date_day"], y=daily_agg["unmatched"],
+        name="Unmatched", marker_color="#CCCCCC",
+    ))
+trend_fig.update_layout(
+    barmode="stack",
+    height=350,
+    margin=dict(l=40, r=40, t=20, b=40),
+    yaxis=dict(title="Daily spend ($)"),
+    xaxis=dict(title=None),
+    bargap=0.2,
+    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+)
+st.plotly_chart(trend_fig, use_container_width=True)
+
+# Show unmatched so you can update the pattern rule or rename campaigns
+unmatched_campaigns = bucketed[bucketed["unmatched"] > 0][
+    ["platform", "campaign_name", "spend"]
+].sort_values("spend", ascending=False)
+
+if len(unmatched_campaigns) > 0:
+    with st.expander(
+        f"⚠️ {len(unmatched_campaigns)} unmatched LinkedIn campaign(s), "
+        f"${unmatched_total:,.0f} MTD"
+    ):
+        st.write(
+            "These campaigns don't contain 'tier' or 'high-velo' in their names. "
+            "Either rename in LinkedIn going forward, or tell me which bucket they belong in."
+        )
+        st.dataframe(unmatched_campaigns, use_container_width=True, hide_index=True)
