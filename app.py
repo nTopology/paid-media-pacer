@@ -263,8 +263,8 @@ col4.metric(
 st.divider()
 st.subheader("What to do about it")
 
-# We need channel data to recommend a split, so load it up front. The
-# real chart section below will reuse the cached result.
+# Load channel data once for the recommendation logic.
+# The chart section below reuses the cached result.
 try:
     _channel_data_for_panel = load_daily_spend_by_channel(month_start)
 except Exception as e:
@@ -280,55 +280,60 @@ _panel_groups = {
 _channel_data_for_panel["channel_group"] = (
     _channel_data_for_panel["platform"].map(_panel_groups).fillna("Other")
 )
+
+last_7d_cutoff = today - pd.Timedelta(days=7)
+recent_by_channel = (
+    _channel_data_for_panel[_channel_data_for_panel["date_day"] >= last_7d_cutoff]
+    .groupby("channel_group")["daily_spend"].sum() / 7
+).to_dict()
 mtd_by_channel = (
     _channel_data_for_panel.groupby("channel_group")["daily_spend"].sum().to_dict()
 )
+
 li_share = mtd_by_channel.get("LinkedIn", 0) / mtd_spend if mtd_spend else 0
 gg_share = mtd_by_channel.get("Google", 0) / mtd_spend if mtd_spend else 0
+li_current = recent_by_channel.get("LinkedIn", 0)
+gg_current = recent_by_channel.get("Google", 0)
 
 days_left = days_in_month - day_of_month
 needed_daily_total = (monthly_budget - mtd_spend) / days_left if days_left else 0
-
-current_avg_last_7d = (
-    _channel_data_for_panel[
-        _channel_data_for_panel["date_day"] >= (today - pd.Timedelta(days=7))
-    ]["daily_spend"].sum() / 7
-)
+current_avg_last_7d = sum(recent_by_channel.values())
 daily_delta = needed_daily_total - current_avg_last_7d
+li_target = needed_daily_total * li_share
+gg_target = needed_daily_total * gg_share
 
 if abs(variance) < monthly_budget * 0.02:
     st.success(
-        f"**On pace.** MTD spend of ${mtd_spend:,.0f} is within 2% of the "
-        f"expected ${expected_spend_today:,.0f} for day {day_of_month}. "
-        f"Maintain current daily spend of ~${current_avg_last_7d:,.0f}."
+        f"**On pace.** MTD spend of \\${mtd_spend:,.0f} is within 2% of "
+        f"expected \\${expected_spend_today:,.0f} for day {day_of_month}. "
+        f"Maintain current daily spend of about \\${current_avg_last_7d:,.0f}."
     )
 elif variance < 0:
-    li_target = needed_daily_total * li_share
-    gg_target = needed_daily_total * gg_share
     st.warning(
-        f"**Under pace by ${abs(variance):,.0f}.** Total daily spend needs to "
-        f"increase to **${needed_daily_total:,.0f}/day** for the remaining "
-        f"{days_left} days (currently averaging ${current_avg_last_7d:,.0f}/day, "
-        f"a +${daily_delta:,.0f} lift). Preserving the current channel mix, that's:\n\n"
-        f"- LinkedIn: ~${li_target:,.0f}/day ({li_share:.0%} of total)\n"
-        f"- Google: ~${gg_target:,.0f}/day ({gg_share:.0%} of total)\n\n"
-        f"The easiest lever is increasing daily caps on top-performing LinkedIn "
-        f"campaigns, since LinkedIn is carrying the majority of spend."
+        f"**Under pace by \\${abs(variance):,.0f}.** "
+        f"Daily spend needs to lift from \\${current_avg_last_7d:,.0f}/day to "
+        f"\\${needed_daily_total:,.0f}/day for the remaining {days_left} days "
+        f"(+\\${daily_delta:,.0f}/day).\n\n"
+        f"Channel split at the current mix:\n"
+        f"- LinkedIn: \\${li_current:,.0f}/day → \\${li_target:,.0f}/day "
+        f"({li_share:.0%} of total)\n"
+        f"- Google: \\${gg_current:,.0f}/day → \\${gg_target:,.0f}/day "
+        f"({gg_share:.0%} of total)"
     )
 else:
-    li_target = needed_daily_total * li_share
-    gg_target = needed_daily_total * gg_share
     st.error(
-        f"**Over pace by ${variance:,.0f}.** Total daily spend needs to "
-        f"drop to **${needed_daily_total:,.0f}/day** for the remaining "
-        f"{days_left} days (currently averaging ${current_avg_last_7d:,.0f}/day, "
-        f"a ${daily_delta:,.0f} cut). Preserving the current channel mix, that's:\n\n"
-        f"- LinkedIn: ~${li_target:,.0f}/day ({li_share:.0%} of total)\n"
-        f"- Google: ~${gg_target:,.0f}/day ({gg_share:.0%} of total)\n\n"
-        f"Pause or reduce daily caps on LinkedIn campaigns first since "
-        f"that channel has the most spend volume to cut."
+        f"**Over pace by \\${variance:,.0f}.** "
+        f"Daily spend needs to drop from \\${current_avg_last_7d:,.0f}/day to "
+        f"\\${needed_daily_total:,.0f}/day for the remaining {days_left} days "
+        f"(\\${abs(daily_delta):,.0f}/day cut).\n\n"
+        f"Channel split at the current mix:\n"
+        f"- LinkedIn: \\${li_current:,.0f}/day → \\${li_target:,.0f}/day "
+        f"({li_share:.0%} of total)\n"
+        f"- Google: \\${gg_current:,.0f}/day → \\${gg_target:,.0f}/day "
+        f"({gg_share:.0%} of total)"
     )
-    # Daily spend chart
+      
+# Daily spend chart
 st.divider()
 st.subheader(f"Daily spend, {today.strftime('%B %Y')}")
 
