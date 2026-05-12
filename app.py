@@ -195,29 +195,74 @@ col4.metric(
     delta_color="inverse",
 )
 
-# Plain-English summary
+# Action panel
 st.divider()
+st.subheader("What to do about it")
+
+# We need channel data to recommend a split, so load it up front. The
+# real chart section below will reuse the cached result.
+try:
+    _channel_data_for_panel = load_daily_spend_by_channel(month_start)
+except Exception as e:
+    st.error(f"Could not load channel data: {type(e).__name__}: {e}")
+    st.stop()
+
+_panel_groups = {
+    "linkedin_ads": "LinkedIn",
+    "google_ads": "Google",
+    "microsoft_ads": "Other",
+    "reddit_ads": "Other",
+}
+_channel_data_for_panel["channel_group"] = (
+    _channel_data_for_panel["platform"].map(_panel_groups).fillna("Other")
+)
+mtd_by_channel = (
+    _channel_data_for_panel.groupby("channel_group")["daily_spend"].sum().to_dict()
+)
+li_share = mtd_by_channel.get("LinkedIn", 0) / mtd_spend if mtd_spend else 0
+gg_share = mtd_by_channel.get("Google", 0) / mtd_spend if mtd_spend else 0
+
+days_left = days_in_month - day_of_month
+needed_daily_total = (monthly_budget - mtd_spend) / days_left if days_left else 0
+
+current_avg_last_7d = (
+    _channel_data_for_panel[
+        _channel_data_for_panel["date_day"] >= (today - pd.Timedelta(days=7))
+    ]["daily_spend"].sum() / 7
+)
+daily_delta = needed_daily_total - current_avg_last_7d
 
 if abs(variance) < monthly_budget * 0.02:
-    st.info(
-        f"You are on pace. MTD spend of ${mtd_spend:,.0f} is within 2% of the "
-        f"expected ${expected_spend_today:,.0f} for day {day_of_month}."
+    st.success(
+        f"**On pace.** MTD spend of ${mtd_spend:,.0f} is within 2% of the "
+        f"expected ${expected_spend_today:,.0f} for day {day_of_month}. "
+        f"Maintain current daily spend of ~${current_avg_last_7d:,.0f}."
     )
 elif variance < 0:
-    days_left = days_in_month - day_of_month
-    needed_daily = (monthly_budget - mtd_spend) / days_left if days_left else 0
+    li_target = needed_daily_total * li_share
+    gg_target = needed_daily_total * gg_share
     st.warning(
-        f"You are ${abs(variance):,.0f} under pace. To land on budget by month end, "
-        f"daily spend needs to average ${needed_daily:,.0f} for the remaining "
-        f"{days_left} days."
+        f"**Under pace by ${abs(variance):,.0f}.** Total daily spend needs to "
+        f"increase to **${needed_daily_total:,.0f}/day** for the remaining "
+        f"{days_left} days (currently averaging ${current_avg_last_7d:,.0f}/day, "
+        f"a +${daily_delta:,.0f} lift). Preserving the current channel mix, that's:\n\n"
+        f"- LinkedIn: ~${li_target:,.0f}/day ({li_share:.0%} of total)\n"
+        f"- Google: ~${gg_target:,.0f}/day ({gg_share:.0%} of total)\n\n"
+        f"The easiest lever is increasing daily caps on top-performing LinkedIn "
+        f"campaigns, since LinkedIn is carrying the majority of spend."
     )
 else:
-    days_left = days_in_month - day_of_month
-    needed_daily = (monthly_budget - mtd_spend) / days_left if days_left else 0
+    li_target = needed_daily_total * li_share
+    gg_target = needed_daily_total * gg_share
     st.error(
-        f"You are ${variance:,.0f} over pace. To land on budget by month end, "
-        f"daily spend needs to drop to ${needed_daily:,.0f} for the remaining "
-        f"{days_left} days."
+        f"**Over pace by ${variance:,.0f}.** Total daily spend needs to "
+        f"drop to **${needed_daily_total:,.0f}/day** for the remaining "
+        f"{days_left} days (currently averaging ${current_avg_last_7d:,.0f}/day, "
+        f"a ${daily_delta:,.0f} cut). Preserving the current channel mix, that's:\n\n"
+        f"- LinkedIn: ~${li_target:,.0f}/day ({li_share:.0%} of total)\n"
+        f"- Google: ~${gg_target:,.0f}/day ({gg_share:.0%} of total)\n\n"
+        f"Pause or reduce daily caps on LinkedIn campaigns first since "
+        f"that channel has the most spend volume to cut."
     )
     # Daily spend chart
 st.divider()
@@ -290,25 +335,13 @@ st.plotly_chart(fig, use_container_width=True)
 st.divider()
 st.subheader(f"Channel breakdown, {today.strftime('%B %Y')}")
 
-try:
-    channel_df = load_daily_spend_by_channel(month_start)
-except Exception as e:
-    st.error(f"Could not load channel spend from BigQuery: {type(e).__name__}: {e}")
-    st.stop()
-
-# Map raw platform names from BigQuery to display groups.
-# Microsoft and Reddit get lumped into "Other" because their combined
-# spend is a rounding error against LinkedIn and Google.
-CHANNEL_GROUPS = {
-    "linkedin_ads": "LinkedIn",
-    "google_ads": "Google",
-    "microsoft_ads": "Other",
-    "reddit_ads": "Other",
-}
-channel_df["channel_group"] = channel_df["platform"].map(CHANNEL_GROUPS).fillna("Other")
-
-# Pre-aggregate each group's daily totals once, so the tab rendering is fast.
-grouped = channel_df.groupby(["date_day", "channel_group"], as_index=False)["daily_spend"].sum()
+# Reuse the channel data already loaded for the action panel
+_channel_data_for_panel["channel_group"] = (
+    _channel_data_for_panel["platform"].map(_panel_groups).fillna("Other")
+)
+grouped = _channel_data_for_panel.groupby(
+    ["date_day", "channel_group"], as_index=False
+)["daily_spend"].sum()
 
 
 def render_channel_view(channel_name: str, channel_data: pd.DataFrame, color: str) -> None:
@@ -317,14 +350,14 @@ def render_channel_view(channel_name: str, channel_data: pd.DataFrame, color: st
         st.info(f"No spend recorded for {channel_name} this month yet.")
         return
 
-    mtd = channel_data["daily_spend"].sum()
-    share_of_total = mtd / mtd_spend if mtd_spend else 0
+    ch_mtd = channel_data["daily_spend"].sum()
+    share_of_total = ch_mtd / mtd_spend if mtd_spend else 0
     last_7_days_cutoff = today - pd.Timedelta(days=7)
     recent = channel_data[channel_data["date_day"] >= last_7_days_cutoff]
     avg_daily_7d = recent["daily_spend"].sum() / 7 if len(recent) else 0
 
     c1, c2, c3 = st.columns(3)
-    c1.metric(f"{channel_name} MTD", f"${mtd:,.0f}")
+    c1.metric(f"{channel_name} MTD", f"${ch_mtd:,.0f}")
     c2.metric("Share of total spend", f"{share_of_total:.0%}")
     c3.metric("Avg daily (last 7d)", f"${avg_daily_7d:,.0f}")
 
