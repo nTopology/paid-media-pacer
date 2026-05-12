@@ -9,6 +9,7 @@ from calendar import monthrange
 
 import pandas as pd
 import streamlit as st
+import plotly.graph_objects as go
 from google.cloud import bigquery
 from google.oauth2 import service_account
 
@@ -78,7 +79,28 @@ def load_mtd_spend(month_start: date) -> float:
     result = client.query(query, job_config=job_config).to_dataframe(create_bqstorage_client=False)
     value = result["mtd_spend"].iloc[0]
     return float(value) if value is not None else 0.0
-
+@st.cache_data(ttl=3600)
+def load_daily_spend(month_start: date) -> pd.DataFrame:
+    """Get daily total spend for the given month, one row per day."""
+    query = f"""
+    SELECT
+        date_day,
+        ROUND(SUM(spend), 2) AS daily_spend
+    FROM `{BIGQUERY_TABLE}`
+    WHERE date_day >= @month_start
+      AND date_day <= CURRENT_DATE()
+    GROUP BY date_day
+    ORDER BY date_day
+    """
+    job_config = bigquery.QueryJobConfig(
+        query_parameters=[
+            bigquery.ScalarQueryParameter("month_start", "DATE", month_start),
+        ]
+    )
+    client = get_bq_client()
+    df = client.query(query, job_config=job_config).to_dataframe(create_bqstorage_client=False)
+    df["date_day"] = pd.to_datetime(df["date_day"]).dt.date
+    return df
 
 # Main app
 today = date.today()
@@ -173,3 +195,69 @@ else:
         f"daily spend needs to drop to ${needed_daily:,.0f} for the remaining "
         f"{days_left} days."
     )
+    # Daily spend chart
+st.divider()
+st.subheader(f"Daily spend, {today.strftime('%B %Y')}")
+
+try:
+    daily_df = load_daily_spend(month_start)
+except Exception as e:
+    st.error(f"Could not load daily spend from BigQuery: {type(e).__name__}: {e}")
+    st.stop()
+
+# Build the expected linear pace line: a straight line from $0 on day 1
+# to the full monthly budget on the last day of the month.
+daily_target = monthly_budget / days_in_month
+all_days = pd.date_range(month_start, periods=days_in_month, freq="D").date
+pace_df = pd.DataFrame({
+    "date_day": all_days,
+    "cumulative_pace": [(i + 1) * daily_target for i in range(days_in_month)],
+})
+
+# Cumulative actual spend
+daily_df_sorted = daily_df.sort_values("date_day").copy()
+daily_df_sorted["cumulative_spend"] = daily_df_sorted["daily_spend"].cumsum()
+
+fig = go.Figure()
+
+# Daily spend as bars
+fig.add_trace(go.Bar(
+    x=daily_df_sorted["date_day"],
+    y=daily_df_sorted["daily_spend"],
+    name="Daily spend",
+    marker_color="#0047FF",
+    yaxis="y",
+))
+
+# Cumulative actual on a second y-axis (line)
+fig.add_trace(go.Scatter(
+    x=daily_df_sorted["date_day"],
+    y=daily_df_sorted["cumulative_spend"],
+    name="Cumulative actual",
+    mode="lines+markers",
+    line=dict(color="#1a1a1a", width=3),
+    yaxis="y2",
+))
+
+# Expected pace line (also on second y-axis)
+fig.add_trace(go.Scatter(
+    x=pace_df["date_day"],
+    y=pace_df["cumulative_pace"],
+    name="Expected pace",
+    mode="lines",
+    line=dict(color="#888888", width=2, dash="dash"),
+    yaxis="y2",
+))
+
+fig.update_layout(
+    height=450,
+    margin=dict(l=40, r=40, t=20, b=40),
+    hovermode="x unified",
+    legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+    yaxis=dict(title="Daily spend ($)", side="left"),
+    yaxis2=dict(title="Cumulative ($)", side="right", overlaying="y", showgrid=False),
+    xaxis=dict(title=None),
+    bargap=0.2,
+)
+
+st.plotly_chart(fig, use_container_width=True)
