@@ -37,7 +37,7 @@ GOOGLE_DEFAULT = (0.0, 1.0)  # Any other Google campaign with spend = 100% HV
 
 
 # Page setup
-st.set_page_config(page_title="Paid Media Pacer", layout="wide")
+st.set_page_config(page_title="Paid Media Pacer", page_icon="📊", layout="wide")
 st.title("Paid Media Pacer")
 
 

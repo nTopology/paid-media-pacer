@@ -6,6 +6,7 @@ Spend, engagement, and lifecycle funnel by channel + Strategic/HV/Expansion opp 
 from datetime import date
 
 import pandas as pd
+import plotly.graph_objects as go
 import streamlit as st
 from google.cloud import bigquery
 from google.oauth2 import service_account
@@ -347,7 +348,7 @@ def render_snapshot(month: date, label_prefix: str = "") -> None:
 # View selector
 view_mode = st.radio(
     "View",
-    options=["Single month", "Month-over-month"],
+    options=["Single month", "Month-over-month", "Trend over time"],
     horizontal=True,
     label_visibility="collapsed",
 )
@@ -356,7 +357,7 @@ st.divider()
 
 if view_mode == "Single month":
     render_snapshot(selected_month)
-else:
+elif view_mode == "Month-over-month":
     available_for_comparison = [m for m in available_months if m != selected_month]
     if not available_for_comparison:
         st.warning("Need at least two months of data to compare.")
@@ -375,3 +376,135 @@ else:
             render_snapshot(selected_month, label_prefix="A")
         with col_right:
             render_snapshot(comparison_month, label_prefix="B")
+
+else:  # Trend over time
+    # Use the last 12 months ascending so the chart reads left to right
+    trend_months = sorted(set(funnel_df["month_start"]))[-12:]
+
+    # Build a wide table: rows = month, cols = stages, values = totals across paid channels
+    paid_only = funnel_df[
+        funnel_df["channel_group"].isin(["LinkedIn", "Google", "Microsoft", "Other Paid"])
+    ]
+    funnel_trend = paid_only.groupby("month_start", as_index=False).agg({
+        "accounts_aware": "sum",
+        "accounts_engaged": "sum",
+        "accounts_mqa": "sum",
+        "accounts_sqa": "sum",
+    })
+    spend_trend = spend_df.groupby("month_start", as_index=False).agg({"spend": "sum"})
+
+    funnel_trend = funnel_trend[funnel_trend["month_start"].isin(trend_months)]
+    spend_trend = spend_trend[spend_trend["month_start"].isin(trend_months)]
+
+    # The most recent 3 months are "still maturing" for cohort purposes
+    maturity_cutoff = trend_months[-3] if len(trend_months) >= 3 else trend_months[0]
+
+    st.subheader("Funnel trend, last 12 months")
+    st.caption(
+        "Most recent 3 months shown faded — opps and SQA from these months are still maturing. "
+        "Treat as directional only."
+    )
+
+    trend_fig = go.Figure()
+
+    def add_line(df, x_col, y_col, name, color):
+        # Split into mature and maturing halves so we can color them differently
+        mature = df[df[x_col] < maturity_cutoff]
+        maturing = df[df[x_col] >= maturity_cutoff]
+        if not mature.empty:
+            trend_fig.add_trace(go.Scatter(
+                x=mature[x_col], y=mature[y_col], name=name,
+                mode="lines+markers", line=dict(color=color, width=3),
+                legendgroup=name, showlegend=True,
+            ))
+        if not maturing.empty:
+            trend_fig.add_trace(go.Scatter(
+                x=maturing[x_col], y=maturing[y_col], name=name,
+                mode="lines+markers",
+                line=dict(color=color, width=3, dash="dot"),
+                marker=dict(symbol="circle-open"),
+                opacity=0.5,
+                legendgroup=name, showlegend=False,
+            ))
+
+    add_line(funnel_trend, "month_start", "accounts_aware", "Aware", "#0047FF")
+    add_line(funnel_trend, "month_start", "accounts_engaged", "Engaged", "#34A853")
+    add_line(funnel_trend, "month_start", "accounts_mqa", "MQA", "#F5A623")
+    add_line(funnel_trend, "month_start", "accounts_sqa", "SQA", "#1a1a1a")
+
+    trend_fig.update_layout(
+        height=400,
+        margin=dict(l=40, r=40, t=20, b=40),
+        yaxis=dict(title="Accounts"),
+        xaxis=dict(title=None),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        hovermode="x unified",
+    )
+    st.plotly_chart(trend_fig, use_container_width=True)
+
+    # Spend trend below
+    st.markdown("**Paid spend by month**")
+    spend_fig = go.Figure()
+    spend_fig.add_trace(go.Bar(
+        x=spend_trend["month_start"],
+        y=spend_trend["spend"],
+        marker_color=[
+            "#0047FF" if m < maturity_cutoff else "rgba(0,71,255,0.4)"
+            for m in spend_trend["month_start"]
+        ],
+    ))
+    spend_fig.update_layout(
+        height=300,
+        margin=dict(l=40, r=40, t=20, b=40),
+        yaxis=dict(title="Spend ($)"),
+        xaxis=dict(title=None),
+        bargap=0.2,
+        showlegend=False,
+    )
+    st.plotly_chart(spend_fig, use_container_width=True)
+
+    # Outcomes trend: opp counts by segment, stacked
+    st.markdown("**Opp outcomes by month**")
+    st.caption(
+        "Stacked bar by segment. Recent months faded because opp pipeline from these months "
+        "is still being created and may grow."
+    )
+    outcomes_trend = opp_df[opp_df["month_start"].isin(trend_months)].copy()
+    outcomes_pivot = outcomes_trend.pivot_table(
+        index="month_start", columns="segment", values="opp_count", aggfunc="sum"
+    ).fillna(0).reset_index()
+    for segment in ["Strategic", "HV", "Expansion"]:
+        if segment not in outcomes_pivot.columns:
+            outcomes_pivot[segment] = 0
+
+    outcomes_fig = go.Figure()
+    seg_colors = {"Strategic": "#0047FF", "HV": "#F5A623", "Expansion": "#34A853"}
+    for segment in ["Strategic", "HV", "Expansion"]:
+        mature_mask = outcomes_pivot["month_start"] < maturity_cutoff
+        outcomes_fig.add_trace(go.Bar(
+            x=outcomes_pivot["month_start"],
+            y=outcomes_pivot[segment],
+            name=segment,
+            marker_color=[
+                seg_colors[segment] if mature else f"rgba(0,0,0,0)"
+                for mature in mature_mask
+            ],
+            # Use a fainter version for maturing months by adjusting opacity per bar
+            marker=dict(
+                color=[
+                    seg_colors[segment] if mature else seg_colors[segment]
+                    for mature in mature_mask
+                ],
+                opacity=[1.0 if mature else 0.4 for mature in mature_mask],
+            ),
+        ))
+    outcomes_fig.update_layout(
+        barmode="stack",
+        height=350,
+        margin=dict(l=40, r=40, t=20, b=40),
+        yaxis=dict(title="Opps created"),
+        xaxis=dict(title=None),
+        bargap=0.2,
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+    )
+    st.plotly_chart(outcomes_fig, use_container_width=True)
