@@ -233,121 +233,145 @@ st.caption(
 )
 
 
-# Filter data to the selected month
-spend_month = spend_df[spend_df["month_start"] == selected_month]
-funnel_month = funnel_df[funnel_df["month_start"] == selected_month]
-opp_month = opp_df[opp_df["month_start"] == selected_month]
+def render_snapshot(month: date, label_prefix: str = "") -> None:
+    """Render the funnel + outcomes for one month. label_prefix is shown in headers when comparing."""
+    spend_month = spend_df[spend_df["month_start"] == month]
+    funnel_month = funnel_df[funnel_df["month_start"] == month]
+    opp_month = opp_df[opp_df["month_start"] == month]
 
+    # Funnel section
+    header = f"Funnel, {month.strftime('%B %Y')}"
+    if label_prefix:
+        header = f"{label_prefix} — {header}"
+    st.subheader(header)
 
-# Funnel section
-st.divider()
-st.subheader(f"Funnel, {selected_month.strftime('%B %Y')}")
+    paid_funnel = funnel_month[
+        funnel_month["channel_group"].isin(["LinkedIn", "Google", "Microsoft", "Other Paid"])
+    ]
+    total_spend = spend_month["spend"].sum()
+    total_aware = paid_funnel["accounts_aware"].sum()
+    total_engaged = paid_funnel["accounts_engaged"].sum()
+    total_mqa = paid_funnel["accounts_mqa"].sum()
+    total_sqa = paid_funnel["accounts_sqa"].sum()
 
-# Compute totals across paid channels only
-paid_funnel = funnel_month[
-    funnel_month["channel_group"].isin(["LinkedIn", "Google", "Microsoft", "Other Paid"])
-]
-total_spend = spend_month["spend"].sum()
-total_aware = paid_funnel["accounts_aware"].sum()
-total_engaged = paid_funnel["accounts_engaged"].sum()
-total_mqa = paid_funnel["accounts_mqa"].sum()
-total_sqa = paid_funnel["accounts_sqa"].sum()
+    fc1, fc2, fc3, fc4, fc5 = st.columns(5)
+    fc1.metric("Paid Spend", fmt_money(total_spend))
+    fc2.metric("Aware accounts", fmt_count(total_aware))
+    fc3.metric("Engaged", fmt_count(total_engaged))
+    fc4.metric("MQA", fmt_count(total_mqa))
+    fc5.metric("SQA", fmt_count(total_sqa))
 
-# Conversion rates between stages
-def pct(num, denom):
-    return f"{num / denom:.0%}" if denom else "—"
-
-fc1, fc2, fc3, fc4, fc5 = st.columns(5)
-fc1.metric("Paid Spend", fmt_money(total_spend))
-fc2.metric("Aware accounts", fmt_count(total_aware))
-fc3.metric("Engaged", fmt_count(total_engaged))
-fc4.metric("MQA", fmt_count(total_mqa))
-fc5.metric("SQA", fmt_count(total_sqa))
-
-
-# Channel split table
-st.markdown("**By paid channel**")
-channel_view = paid_funnel.groupby("channel_group", as_index=False).agg({
-    "accounts_aware": "sum",
-    "accounts_engaged": "sum",
-    "accounts_mqa": "sum",
-    "accounts_sqa": "sum",
-})
-spend_by_channel = spend_month.groupby("platform", as_index=False).agg({"spend": "sum"})
-platform_to_channel = {
-    "linkedin_ads": "LinkedIn",
-    "google_ads": "Google",
-    "microsoft_ads": "Microsoft",
-    "reddit_ads": "Other Paid",
-    "facebook_ads": "Other Paid",
-}
-spend_by_channel["channel_group"] = spend_by_channel["platform"].map(platform_to_channel).fillna("Other Paid")
-spend_by_channel = spend_by_channel.groupby("channel_group", as_index=False).agg({"spend": "sum"})
-
-channel_view = channel_view.merge(spend_by_channel, on="channel_group", how="left")
-channel_view["spend"] = channel_view["spend"].fillna(0)
-channel_view = channel_view[["channel_group", "spend", "accounts_aware", "accounts_engaged", "accounts_mqa", "accounts_sqa"]]
-channel_view = channel_view.rename(columns={
-    "channel_group": "Channel",
-    "spend": "Spend ($)",
-    "accounts_aware": "Aware",
-    "accounts_engaged": "Engaged",
-    "accounts_mqa": "MQA",
-    "accounts_sqa": "SQA",
-})
-
-st.dataframe(
-    channel_view,
-    hide_index=True,
-    use_container_width=True,
-    column_config={
-        "Spend ($)": st.column_config.NumberColumn(format="$%.0f"),
-        "Aware": st.column_config.NumberColumn(format="%d"),
-        "Engaged": st.column_config.NumberColumn(format="%d"),
-        "MQA": st.column_config.NumberColumn(format="%d"),
-        "SQA": st.column_config.NumberColumn(format="%d"),
-    },
-)
-
-
-# Outcomes section
-st.divider()
-st.subheader(f"Outcomes, {selected_month.strftime('%B %Y')}")
-st.caption(
-    "Opps created in this month. Not channel-attributed (Salesforce attribution data is too sparse "
-    "to reliably tie opps back to paid channels). ARR populated on ~19% of opps."
-)
-
-# Bucket and aggregate
-outcomes = opp_month.groupby("segment", as_index=False).agg({
-    "opp_count": "sum",
-    "total_arr": "sum",
-    "new_expansion_arr": "sum",
-    "opps_with_arr": "sum",
-})
-
-# Ensure all three segments show even if zero
-for segment in ["Strategic", "HV", "Expansion"]:
-    if segment not in outcomes["segment"].values:
-        outcomes = pd.concat([
-            outcomes,
-            pd.DataFrame([{
-                "segment": segment, "opp_count": 0, "total_arr": 0,
-                "new_expansion_arr": 0, "opps_with_arr": 0,
-            }]),
-        ], ignore_index=True)
-
-# Order the segments deterministically
-segment_order = {"Strategic": 0, "HV": 1, "Expansion": 2}
-outcomes = outcomes[outcomes["segment"].isin(segment_order.keys())]
-outcomes = outcomes.sort_values("segment", key=lambda s: s.map(segment_order))
-
-oc1, oc2, oc3 = st.columns(3)
-for col, (_, row) in zip([oc1, oc2, oc3], outcomes.iterrows()):
-    seg = row["segment"]
-    col.metric(
-        f"{seg} opps",
-        fmt_count(row["opp_count"]),
-        f"{fmt_money(row['total_arr'])} ARR ({int(row['opps_with_arr'])} of {int(row['opp_count'])} with ARR)",
-        delta_color="off",
+    st.markdown("**By paid channel**")
+    channel_view = paid_funnel.groupby("channel_group", as_index=False).agg({
+        "accounts_aware": "sum",
+        "accounts_engaged": "sum",
+        "accounts_mqa": "sum",
+        "accounts_sqa": "sum",
+    })
+    spend_by_channel = spend_month.groupby("platform", as_index=False).agg({"spend": "sum"})
+    platform_to_channel = {
+        "linkedin_ads": "LinkedIn",
+        "google_ads": "Google",
+        "microsoft_ads": "Microsoft",
+        "reddit_ads": "Other Paid",
+        "facebook_ads": "Other Paid",
+    }
+    spend_by_channel["channel_group"] = (
+        spend_by_channel["platform"].map(platform_to_channel).fillna("Other Paid")
     )
+    spend_by_channel = spend_by_channel.groupby("channel_group", as_index=False).agg({"spend": "sum"})
+
+    channel_view = channel_view.merge(spend_by_channel, on="channel_group", how="left")
+    channel_view["spend"] = channel_view["spend"].fillna(0)
+    channel_view = channel_view[[
+        "channel_group", "spend", "accounts_aware", "accounts_engaged", "accounts_mqa", "accounts_sqa"
+    ]]
+    channel_view = channel_view.rename(columns={
+        "channel_group": "Channel",
+        "spend": "Spend ($)",
+        "accounts_aware": "Aware",
+        "accounts_engaged": "Engaged",
+        "accounts_mqa": "MQA",
+        "accounts_sqa": "SQA",
+    })
+
+    st.dataframe(
+        channel_view,
+        hide_index=True,
+        use_container_width=True,
+        column_config={
+            "Spend ($)": st.column_config.NumberColumn(format="$%.0f"),
+            "Aware": st.column_config.NumberColumn(format="%d"),
+            "Engaged": st.column_config.NumberColumn(format="%d"),
+            "MQA": st.column_config.NumberColumn(format="%d"),
+            "SQA": st.column_config.NumberColumn(format="%d"),
+        },
+    )
+
+    # Outcomes section
+    outcomes_header = f"Outcomes, {month.strftime('%B %Y')}"
+    if label_prefix:
+        outcomes_header = f"{label_prefix} — {outcomes_header}"
+    st.markdown(f"**{outcomes_header}**")
+
+    outcomes = opp_month.groupby("segment", as_index=False).agg({
+        "opp_count": "sum",
+        "total_arr": "sum",
+        "new_expansion_arr": "sum",
+        "opps_with_arr": "sum",
+    })
+    for segment in ["Strategic", "HV", "Expansion"]:
+        if segment not in outcomes["segment"].values:
+            outcomes = pd.concat([
+                outcomes,
+                pd.DataFrame([{
+                    "segment": segment, "opp_count": 0, "total_arr": 0,
+                    "new_expansion_arr": 0, "opps_with_arr": 0,
+                }]),
+            ], ignore_index=True)
+    segment_order = {"Strategic": 0, "HV": 1, "Expansion": 2}
+    outcomes = outcomes[outcomes["segment"].isin(segment_order.keys())]
+    outcomes = outcomes.sort_values("segment", key=lambda s: s.map(segment_order))
+
+    oc1, oc2, oc3 = st.columns(3)
+    for col, (_, row) in zip([oc1, oc2, oc3], outcomes.iterrows()):
+        seg = row["segment"]
+        col.metric(
+            f"{seg} opps",
+            fmt_count(row["opp_count"]),
+            f"{fmt_money(row['total_arr'])} ARR ({int(row['opps_with_arr'])} of {int(row['opp_count'])} with ARR)",
+            delta_color="off",
+        )
+
+
+# View selector
+view_mode = st.radio(
+    "View",
+    options=["Single month", "Month-over-month"],
+    horizontal=True,
+    label_visibility="collapsed",
+)
+
+st.divider()
+
+if view_mode == "Single month":
+    render_snapshot(selected_month)
+else:
+    available_for_comparison = [m for m in available_months if m != selected_month]
+    if not available_for_comparison:
+        st.warning("Need at least two months of data to compare.")
+    else:
+        comparison_default = available_for_comparison[0]
+        comparison_month = st.selectbox(
+            "Compare to",
+            options=available_for_comparison,
+            index=0,
+            format_func=lambda d: d.strftime("%B %Y"),
+            key="comparison_month",
+        )
+        st.divider()
+        col_left, col_right = st.columns(2)
+        with col_left:
+            render_snapshot(selected_month, label_prefix="A")
+        with col_right:
+            render_snapshot(comparison_month, label_prefix="B")
