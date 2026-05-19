@@ -30,6 +30,7 @@ RECORD_TYPE_LABELS = {
 # Channels we care about in the funnel view (rest get lumped as "Other")
 PAID_CHANNEL_MAP = {
     ("Paid Social", "linkedin_ads"): "LinkedIn",
+    ("Warm Outbound", "linkedin_ads"): "LinkedIn",
     ("Paid Search", "google_ads"): "Google",
     ("Paid Search", "microsoft_ads"): "Microsoft",
     ("Paid Social", "facebook_ads"): "Other Paid",
@@ -175,27 +176,178 @@ LEFT JOIN `bi-ntop.google_sheets.opportunity_fields` opf
     return df
 
 
-# Temporary debug: load all three and show the row counts so we can confirm the loaders work
-st.subheader("Loader smoke test")
-st.caption("Temporary diagnostic block. Will be removed before step 3.")
+# Helpers
+def previous_full_month(today: date) -> date:
+    """Return the first day of the previous complete month."""
+    first_of_this_month = today.replace(day=1)
+    if first_of_this_month.month == 1:
+        return date(first_of_this_month.year - 1, 12, 1)
+    return date(first_of_this_month.year, first_of_this_month.month - 1, 1)
 
+
+def fmt_money(value) -> str:
+    if value is None or pd.isna(value):
+        return "$0"
+    return f"${value:,.0f}"
+
+
+def fmt_count(value) -> str:
+    if value is None or pd.isna(value):
+        return "0"
+    return f"{int(value):,}"
+
+
+# Load all data once
 try:
     spend_df = load_spend_by_channel_month(months_back=12)
-    st.write(f"**Spend loader:** {len(spend_df)} rows")
-    st.dataframe(spend_df.head(10), hide_index=True)
-except Exception as e:
-    st.error(f"Spend loader failed: {type(e).__name__}: {e}")
-
-try:
     funnel_df = load_lifecycle_funnel_by_channel_month(months_back=12)
-    st.write(f"**Funnel loader:** {len(funnel_df)} rows")
-    st.dataframe(funnel_df.head(10), hide_index=True)
-except Exception as e:
-    st.error(f"Funnel loader failed: {type(e).__name__}: {e}")
-
-try:
     opp_df = load_opp_outcomes_by_month(months_back=12)
-    st.write(f"**Opp loader:** {len(opp_df)} rows")
-    st.dataframe(opp_df.head(10), hide_index=True)
 except Exception as e:
-    st.error(f"Opp loader failed: {type(e).__name__}: {e}")
+    st.error(f"Failed to load data: {type(e).__name__}: {e}")
+    st.stop()
+
+
+# Month picker
+today = date.today()
+default_month = previous_full_month(today)
+available_months = sorted(
+    set(spend_df["month_start"]) | set(funnel_df["month_start"]) | set(opp_df["month_start"]),
+    reverse=True,
+)
+if default_month not in available_months:
+    default_month = available_months[0]
+
+selected_month = st.selectbox(
+    "Month",
+    options=available_months,
+    index=available_months.index(default_month),
+    format_func=lambda d: d.strftime("%B %Y"),
+)
+
+st.caption(
+    "Funnel data: aware, engaged, MQA, SQA from Deepline's marketing_lifecycle_funnel model. "
+    "Opp data: New Business + Expansion opps created in the selected month from Salesforce, "
+    "bucketed Strategic / HV / Expansion via record_type_id. "
+    "ARR is sourced from google_sheets.opportunity_fields and is only populated on ~19% of opps "
+    "(typically those past early qualification stages)."
+)
+
+
+# Filter data to the selected month
+spend_month = spend_df[spend_df["month_start"] == selected_month]
+funnel_month = funnel_df[funnel_df["month_start"] == selected_month]
+opp_month = opp_df[opp_df["month_start"] == selected_month]
+
+
+# Funnel section
+st.divider()
+st.subheader(f"Funnel, {selected_month.strftime('%B %Y')}")
+
+# Compute totals across paid channels only
+paid_funnel = funnel_month[
+    funnel_month["channel_group"].isin(["LinkedIn", "Google", "Microsoft", "Other Paid"])
+]
+total_spend = spend_month["spend"].sum()
+total_aware = paid_funnel["accounts_aware"].sum()
+total_engaged = paid_funnel["accounts_engaged"].sum()
+total_mqa = paid_funnel["accounts_mqa"].sum()
+total_sqa = paid_funnel["accounts_sqa"].sum()
+
+# Conversion rates between stages
+def pct(num, denom):
+    return f"{num / denom:.0%}" if denom else "—"
+
+fc1, fc2, fc3, fc4, fc5 = st.columns(5)
+fc1.metric("Paid Spend", fmt_money(total_spend))
+fc2.metric("Aware accounts", fmt_count(total_aware))
+fc3.metric("Engaged", fmt_count(total_engaged))
+fc4.metric("MQA", fmt_count(total_mqa))
+fc5.metric("SQA", fmt_count(total_sqa))
+
+
+# Channel split table
+st.markdown("**By paid channel**")
+channel_view = paid_funnel.groupby("channel_group", as_index=False).agg({
+    "accounts_aware": "sum",
+    "accounts_engaged": "sum",
+    "accounts_mqa": "sum",
+    "accounts_sqa": "sum",
+})
+spend_by_channel = spend_month.groupby("platform", as_index=False).agg({"spend": "sum"})
+platform_to_channel = {
+    "linkedin_ads": "LinkedIn",
+    "google_ads": "Google",
+    "microsoft_ads": "Microsoft",
+    "reddit_ads": "Other Paid",
+    "facebook_ads": "Other Paid",
+}
+spend_by_channel["channel_group"] = spend_by_channel["platform"].map(platform_to_channel).fillna("Other Paid")
+spend_by_channel = spend_by_channel.groupby("channel_group", as_index=False).agg({"spend": "sum"})
+
+channel_view = channel_view.merge(spend_by_channel, on="channel_group", how="left")
+channel_view["spend"] = channel_view["spend"].fillna(0)
+channel_view = channel_view[["channel_group", "spend", "accounts_aware", "accounts_engaged", "accounts_mqa", "accounts_sqa"]]
+channel_view = channel_view.rename(columns={
+    "channel_group": "Channel",
+    "spend": "Spend ($)",
+    "accounts_aware": "Aware",
+    "accounts_engaged": "Engaged",
+    "accounts_mqa": "MQA",
+    "accounts_sqa": "SQA",
+})
+
+st.dataframe(
+    channel_view,
+    hide_index=True,
+    use_container_width=True,
+    column_config={
+        "Spend ($)": st.column_config.NumberColumn(format="$%.0f"),
+        "Aware": st.column_config.NumberColumn(format="%d"),
+        "Engaged": st.column_config.NumberColumn(format="%d"),
+        "MQA": st.column_config.NumberColumn(format="%d"),
+        "SQA": st.column_config.NumberColumn(format="%d"),
+    },
+)
+
+
+# Outcomes section
+st.divider()
+st.subheader(f"Outcomes, {selected_month.strftime('%B %Y')}")
+st.caption(
+    "Opps created in this month. Not channel-attributed (Salesforce attribution data is too sparse "
+    "to reliably tie opps back to paid channels). ARR populated on ~19% of opps."
+)
+
+# Bucket and aggregate
+outcomes = opp_month.groupby("segment", as_index=False).agg({
+    "opp_count": "sum",
+    "total_arr": "sum",
+    "new_expansion_arr": "sum",
+    "opps_with_arr": "sum",
+})
+
+# Ensure all three segments show even if zero
+for segment in ["Strategic", "HV", "Expansion"]:
+    if segment not in outcomes["segment"].values:
+        outcomes = pd.concat([
+            outcomes,
+            pd.DataFrame([{
+                "segment": segment, "opp_count": 0, "total_arr": 0,
+                "new_expansion_arr": 0, "opps_with_arr": 0,
+            }]),
+        ], ignore_index=True)
+
+# Order the segments deterministically
+segment_order = {"Strategic": 0, "HV": 1, "Expansion": 2}
+outcomes = outcomes[outcomes["segment"].isin(segment_order.keys())]
+outcomes = outcomes.sort_values("segment", key=lambda s: s.map(segment_order))
+
+oc1, oc2, oc3 = st.columns(3)
+for col, (_, row) in zip([oc1, oc2, oc3], outcomes.iterrows()):
+    seg = row["segment"]
+    col.metric(
+        f"{seg} opps",
+        fmt_count(row["opp_count"]),
+        f"{fmt_money(row['total_arr'])} ARR ({int(row['opps_with_arr'])} of {int(row['opp_count'])} with ARR)",
+        delta_color="off",
+    )
