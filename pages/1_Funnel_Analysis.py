@@ -573,7 +573,7 @@ def render_snapshot(
     if not non_paid.empty:
         other_view = (
             non_paid.groupby("channel", as_index=False)
-            .agg(accounts_aware="sum", accounts_engaged="sum")
+            .agg({"accounts_aware": "sum", "accounts_engaged": "sum"})
             .query("accounts_aware > 0 or accounts_engaged > 0")
             .sort_values("accounts_aware", ascending=False)
         )
