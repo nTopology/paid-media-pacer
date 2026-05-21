@@ -242,18 +242,6 @@ def load_opp_outcomes_by_month(months_back: int = 12) -> pd.DataFrame:
     df = client.query(query, job_config=job_config).to_dataframe(create_bqstorage_client=False)
     df["month_start"] = pd.to_datetime(df["month_start"]).dt.date
 
-    # Strip "a. " / "b. " etc. sort-prefixes from account_segment values,
-    # and map "Missing Info" (z. prefix) to Unknown.
-    # Raw values look like: "a. Strategic", "b. Enterprise", "z. Missing Info"
-    df["account_segment"] = (
-        df["account_segment"]
-        .str.replace(r"^[a-z]\.\s+", "", regex=True)
-        .replace("Missing Info", "Unknown")
-    )
-
-    # Normalize region outliers (country names, city entries) to canonical region buckets.
-    df["region"] = df["region"].map(lambda r: REGION_NORMALIZE.get(r, r))
-
     # Bucket into Strategic / HV / Expansion. Expansion type wins over record_type label
     # (e.g. an HV-record-type-id but Expansion type is an Expansion).
     def bucket(row):
@@ -374,6 +362,26 @@ def load_middle_lower_funnel_by_month(months_back: int = 18) -> pd.DataFrame:
     return df
 
 
+def normalize_opp_df(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Apply segment and region normalization to the opp outcomes DataFrame.
+    This runs OUTSIDE the cache so normalization changes take effect immediately
+    on the next page reload — no need to wait for the 1-hour TTL to expire.
+    The expensive BQ query is still cached; this is just cheap Python string ops.
+    """
+    df = df.copy()
+    # Strip "a. " / "b. " sort-prefixes from raw account_segment values.
+    # "z. Missing Info" → "Unknown" so it doesn't pollute the dropdown.
+    df["account_segment"] = (
+        df["account_segment"]
+        .str.replace(r"^[a-z]\.\s+", "", regex=True)
+        .replace("Missing Info", "Unknown")
+    )
+    # Normalize region outliers (country names, city entries) to canonical buckets.
+    df["region"] = df["region"].map(lambda r: REGION_NORMALIZE.get(r, r))
+    return df
+
+
 # Helpers
 def previous_full_month(today: date) -> date:
     """Return the first day of the previous complete month."""
@@ -399,7 +407,7 @@ def fmt_count(value) -> str:
 try:
     spend_df  = load_spend_by_channel_month(months_back=18)
     funnel_df = load_lifecycle_funnel_by_channel_month(months_back=18)
-    opp_df    = load_opp_outcomes_by_month(months_back=18)
+    opp_df    = normalize_opp_df(load_opp_outcomes_by_month(months_back=18))
     mf_df     = load_middle_lower_funnel_by_month(months_back=18)
 except Exception as e:
     st.error(f"Failed to load data: {type(e).__name__}: {e}")
