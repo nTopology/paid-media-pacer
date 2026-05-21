@@ -4,14 +4,116 @@ A Streamlit app that shows month-to-date paid media spend versus budget,
 pulling spend from BigQuery and budget from a Google Sheet.
 """
 
+import base64
+import json
 from datetime import date, datetime
 from calendar import monthrange
+from pathlib import Path
 
 import pandas as pd
 import streamlit as st
 import plotly.graph_objects as go
 from google.cloud import bigquery
 from google.oauth2 import service_account
+
+
+# ── Brand assets ───────────────────────────────────────────────────────────────
+_BRAND_DIR = Path(__file__).parent.parent / "static" / "brand"
+_LOGO_DIR  = Path(__file__).parent.parent / "static" / "logos"
+
+try:
+    _RAW = json.loads((_BRAND_DIR / "colors.json").read_text())
+    _C = {
+        "blue":       _RAW["accent"]["ntop_blue"]["hex"],
+        "black":      _RAW["primary"]["black"]["hex"],
+        "white":      _RAW["primary"]["white"]["hex"],
+        "green":      _RAW["signal_indicators"]["green"],
+        "red":        _RAW["signal_indicators"]["red"],
+        "gray_light": _RAW["neutrals_optional"]["gray_light"],
+        "gray_mid":   _RAW["neutrals_optional"]["gray_mid"],
+        "gray_dark":  _RAW["neutrals_optional"]["gray_dark"],
+    }
+except Exception:
+    _C = {
+        "blue": "#248AFF", "black": "#000000", "white": "#FFFFFF",
+        "green": "#1FA34E", "red": "#D43F3F",
+        "gray_light": "#E5E5E5", "gray_mid": "#999999", "gray_dark": "#333333",
+    }
+
+_SVG_FILE = _LOGO_DIR / "nTop-Logo_Light-theme.svg"
+_PNG_FILE  = _LOGO_DIR / "nTop-Logo_Light-theme_400w.png"
+
+if _SVG_FILE.exists():
+    _logo_b64      = base64.b64encode(_SVG_FILE.read_bytes()).decode()
+    _LOGO_IMG_HTML = (
+        f'<img src="data:image/svg+xml;base64,{_logo_b64}" '
+        f'height="54" style="display:block;flex-shrink:0;">'
+    )
+elif _PNG_FILE.exists():
+    _logo_b64      = base64.b64encode(_PNG_FILE.read_bytes()).decode()
+    _LOGO_IMG_HTML = (
+        f'<img src="data:image/png;base64,{_logo_b64}" '
+        f'height="54" style="display:block;flex-shrink:0;">'
+    )
+else:
+    _LOGO_IMG_HTML = (
+        f'<span style="font-family:Oswald,sans-serif;font-weight:700;'
+        f'font-size:22px;color:{_C["black"]};">nTop</span>'
+    )
+
+
+# ── Brand CSS ──────────────────────────────────────────────────────────────────
+_BRAND_CSS = f"""
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Oswald:wght@700&family=IBM+Plex+Sans:wght@400;700&family=IBM+Plex+Mono&display=swap');
+
+html, body, .stApp, .stMarkdown, .stCaption, p {{
+    font-family: 'IBM Plex Sans', sans-serif;
+}}
+h1, h2, h3 {{
+    font-family: 'Oswald', sans-serif;
+    font-weight: 700;
+    color: {_C["black"]};
+}}
+section[data-testid="stSidebar"] label,
+section[data-testid="stSidebar"] p,
+section[data-testid="stSidebar"] div {{
+    font-family: 'IBM Plex Sans', sans-serif;
+}}
+.stAlert p, .stAlert div {{
+    font-family: 'IBM Plex Sans', sans-serif;
+    font-size: 14px;
+}}
+/* Page header */
+.ntop-header {{
+    display: flex;
+    align-items: center;
+    gap: 20px;
+    padding-bottom: 20px;
+    margin-bottom: 24px;
+    border-bottom: 2px solid {_C["black"]};
+}}
+.ntop-header-text {{
+    border-left: 1px solid {_C["gray_light"]};
+    padding-left: 20px;
+}}
+.ntop-page-title {{
+    font-family: 'Oswald', sans-serif;
+    font-weight: 700;
+    font-size: 26px;
+    color: {_C["black"]};
+    line-height: 1.15;
+    margin: 0 0 5px 0;
+}}
+.ntop-page-subtitle {{
+    font-family: 'IBM Plex Sans', sans-serif;
+    font-size: 13px;
+    color: {_C["gray_dark"]};
+    margin: 0;
+    line-height: 1.4;
+}}
+</style>
+"""
 
 
 # Configuration
@@ -186,9 +288,25 @@ def load_daily_campaign_spend(month_start: date) -> pd.DataFrame:
     df["date_day"] = pd.to_datetime(df["date_day"]).dt.date
     return df
 
-# Main app
-st.title("Paid Media Pacer")
+# ── Page setup ─────────────────────────────────────────────────────────────────
+st.markdown(_BRAND_CSS, unsafe_allow_html=True)
 
+if _PNG_FILE.exists():
+    st.logo(str(_PNG_FILE))
+
+st.markdown(
+    f'<div class="ntop-header">'
+    f'{_LOGO_IMG_HTML}'
+    f'<div class="ntop-header-text">'
+    f'<div class="ntop-page-title">Paid Media Pacer</div>'
+    f'<div class="ntop-page-subtitle">'
+    f'Month-to-date spend versus budget. '
+    f'Channel breakdown, pacing variance, and Strategic vs High Velocity split.'
+    f'</div></div></div>',
+    unsafe_allow_html=True,
+)
+
+# Main app
 today = date.today()
 month_start = today.replace(day=1)
 days_in_month = monthrange(today.year, today.month)[1]
@@ -361,7 +479,7 @@ fig.add_trace(go.Bar(
     x=daily_df_sorted["date_day"],
     y=daily_df_sorted["daily_spend"],
     name="Daily spend",
-    marker_color="#0047FF",
+    marker_color=_C["blue"],
     yaxis="y",
 ))
 
@@ -452,7 +570,7 @@ tab_total, tab_linkedin, tab_google, tab_other = st.tabs(
 
 with tab_total:
     total_daily = grouped.groupby("date_day", as_index=False)["daily_spend"].sum()
-    render_channel_view("Total", total_daily, "#0047FF")
+    render_channel_view("Total", total_daily, _C["blue"])
 
 with tab_linkedin:
     li_daily = grouped[grouped["channel_group"] == "LinkedIn"]
