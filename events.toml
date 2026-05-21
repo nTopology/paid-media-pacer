@@ -1,0 +1,24 @@
+[[events]]
+date  = "2025-01-01"
+label = "Strategic shift"
+description = "Major strategic shift. Data before Jan 2025 may not be comparable to later periods."
+
+[[events]]
+date  = "2025-04-07"
+label = "New campaign structure"
+description = "New paid-media campaign structure launched. Spend mostly on old structure initially."
+
+[[events]]
+date  = "2025-04-20"
+label = "Spend shift begins"
+description = "Spend began shifting to new campaign structure week of April 20."
+
+[[events]]
+date  = "2025-05-01"
+label = "Old campaigns paused"
+description = "Old paid-media campaigns paused; underperforming campaigns killed."
+
+[[events]]
+date  = "2026-03-15"
+label = "HV pause"
+description = "LinkedIn High-Velocity engagement and video-view campaigns cut ~50%."

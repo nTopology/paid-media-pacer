@@ -9,6 +9,7 @@ __pycache__/
 .env
 *.json
 !sample.json
+!static/**/*.json
 
 # Mac stuff
 .DS_Store

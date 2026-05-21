@@ -1,0 +1,40 @@
+{
+  "primary": {
+    "black": {
+      "hex": "#000000",
+      "rgb": [0, 0, 0],
+      "usage": "Title slide backgrounds, primary text on light backgrounds, borders, rules. Foundational color."
+    },
+    "white": {
+      "hex": "#FFFFFF",
+      "rgb": [255, 255, 255],
+      "usage": "Content slide backgrounds, text on dark backgrounds. Foundational color."
+    }
+  },
+  "accent": {
+    "ntop_blue": {
+      "hex": "#248AFF",
+      "rgb": [36, 138, 255],
+      "usage": "Sparingly. Single emphasized stat, one highlighted word, thin rule line, small badge or icon highlight. Never a background fill, never a title color, never dominant. Cap: one blue element per section/quadrant of a slide."
+    }
+  },
+  "signal_indicators": {
+    "_comment": "Use only for status/state indicators in dashboards or trackers — green for good, red for bad, orange for warning. Not part of the marketing palette. Avoid in standard slides.",
+    "green": "#1FA34E",
+    "red": "#D43F3F",
+    "orange": "#F39C12"
+  },
+  "neutrals_optional": {
+    "_comment": "Light grays are acceptable for subtle hairline rules, captions, or muted footers. Use only when black would feel too heavy.",
+    "gray_light": "#E5E5E5",
+    "gray_mid": "#999999",
+    "gray_dark": "#333333"
+  },
+  "rules": [
+    "Black and white are the foundation of nTop's visual identity. ~90% of every layout should be black, white, or grayscale.",
+    "nTop Blue (#248AFF) is an accent only. Cap: one blue element per section.",
+    "Never use blue as a background fill or as the primary color of body text.",
+    "Number badges (01, 02, 03) are ALWAYS black with white text — never blue.",
+    "Signal indicators (red/green/orange) are for status dashboards only, not marketing materials."
+  ]
+}
