@@ -328,8 +328,6 @@ def load_kpi_summary(as_of: date) -> dict:
     ]
     out: dict = {}
 
-    errors: list[str] = []
-
     try:
         df = _run("""
         SELECT
@@ -339,9 +337,8 @@ def load_kpi_summary(as_of: date) -> dict:
         WHERE date_day BETWEEN @p30_start AND @t30_end AND spend > 0
         """, params)
         out["spend"] = (float(df["current_val"].iloc[0] or 0), float(df["prior_val"].iloc[0] or 0))
-    except Exception as e:
+    except Exception:
         out["spend"] = (0.0, 0.0)
-        errors.append(f"spend: {e}")
 
     try:
         li = _run("""
@@ -369,9 +366,8 @@ def load_kpi_summary(as_of: date) -> dict:
         c = int(li["current_val"].iloc[0] or 0) + int(goog["current_val"].iloc[0] or 0)
         p = int(li["prior_val"].iloc[0]  or 0) + int(goog["prior_val"].iloc[0]  or 0)
         out["engagement"] = (c, p)
-    except Exception as e:
+    except Exception:
         out["engagement"] = (0, 0)
-        errors.append(f"engagement: {e}")
 
     try:
         df = _run("""
@@ -388,9 +384,8 @@ def load_kpi_summary(as_of: date) -> dict:
           AND DATE(cfs.timestamp) BETWEEN @p30_start AND @t30_end
         """, params)
         out["demos"] = (int(df["current_val"].iloc[0] or 0), int(df["prior_val"].iloc[0] or 0))
-    except Exception as e:
+    except Exception:
         out["demos"] = (0, 0)
-        errors.append(f"demos: {e}")
 
     base_where = _opp_base_where()
     try:
@@ -407,11 +402,9 @@ def load_kpi_summary(as_of: date) -> dict:
           AND DATE(o.created_date) BETWEEN @p30_start AND @t30_end
         """, params)
         out["pipeline_arr"] = (float(df["current_val"].iloc[0] or 0), float(df["prior_val"].iloc[0] or 0))
-    except Exception as e:
+    except Exception:
         out["pipeline_arr"] = (0.0, 0.0)
-        errors.append(f"pipeline_arr: {e}")
 
-    out["_errors"] = errors
     return out
 
 
@@ -900,11 +893,6 @@ tiles_html = "".join([
     _kpi_tile_html("Pipeline ARR",      _fmt_currency(kpi["pipeline_arr"][0]), _delta_html(*kpi["pipeline_arr"])),
 ])
 st.markdown(f'<div class="kpi-band">{tiles_html}</div>', unsafe_allow_html=True)
-
-if kpi.get("_errors"):
-    with st.expander("⚠️ KPI diagnostic errors"):
-        for err in kpi["_errors"]:
-            st.code(err)
 
 st.markdown(
     '<div class="kpi-note">Trailing 30 days &middot; vs prior 30 days'
