@@ -28,6 +28,53 @@ RECORD_TYPE_LABELS = {
     "0124R000001JIhxQAG": "Expansion",
 }
 
+# Region normalization — maps country names, city entries, and sub-region variants
+# back to the canonical region buckets used in account_fields.
+# All values not in this map pass through unchanged.
+REGION_NORMALIZE: dict[str, str] = {
+    # North America catch-alls
+    "Americas":                         "North America",
+    "USA - East":                       "North America",
+    "USA":                              "North America",
+    "United States":                    "North America",
+    "United states":                    "North America",
+    "New York, New York":               "North America",
+    "New York":                         "North America",
+    "Virginia, USA":                    "North America",
+    "Huntsville, Alabama":              "North America",
+    "Atlanta Georgia":                  "North America",
+    # Central America (Mexico entries)
+    "Monterrey, Nuevo Leon, Mexico":    "Central America",
+    "Chihuahua, Mexico":                "Central America",
+    "Queretaro Mexio":                  "Central America",
+    # South America
+    "Colombia":                         "South America",
+    "Chile":                            "South America",
+    "Argentina":                        "South America",
+    # Europe
+    "Germany":                          "Western Europe",
+    "France":                           "Western Europe",
+    "Europe":                           "Western Europe",
+    "EMEA":                             "Western Europe",
+    "United Kingdom":                   "Northern Europe",
+    "Norway":                           "Northern Europe",
+    "Central Europe":                   "Eastern Europe",
+    "EMEA East":                        "Eastern Europe",
+    "Russia":                           "Eastern Europe",
+    "Southern Europe - Bosnia & Herzegovina": "Southern Europe",
+    # Middle East
+    "Middle East - Turkey":             "Middle East",
+    # Asia-Pacific
+    "Japan":                            "East Asia",
+    "China":                            "East Asia",
+    "Hong Kong":                        "East Asia",
+    "East Asia/US":                     "East Asia",
+    "East Asia - South Korea":          "East Asia",
+    "India":                            "South Asia",
+    "South Asia - India":               "South Asia",
+    "New Zealand":                      "Australia",
+}
+
 # Channels we care about in the funnel view (rest get lumped as "Other")
 PAID_CHANNEL_MAP = {
     ("Paid Social", "linkedin_ads"): "LinkedIn",
@@ -44,6 +91,26 @@ PAID_CHANNEL_MAP = {
 # Page setup
 st.set_page_config(page_title="Funnel Analysis", layout="wide")
 st.title("Funnel Analysis")
+
+with st.expander("What each stage means", expanded=False):
+    st.markdown("""
+| Stage | Source | Definition |
+|---|---|---|
+| **Aware** | Deepline `marketing_lifecycle_funnel` | Accounts Deepline's model flagged as aware of nTop. Exact scoring criteria TBC — see open questions in `docs/DEEPLINE_FEEDBACK.md`. |
+| **Engaged** | Deepline `marketing_lifecycle_funnel` | Accounts that reached the engaged stage per Deepline's model. Definition TBC. |
+| **Contact Created** | `hubspot.contact` | Distinct accounts (any source, not just paid media) that had ≥1 HubSpot contact created in the month, linked via Salesforce account ID. **This is a full-funnel month total — it includes contacts from inbound, outbound, events, and all channels, not only paid media.** Expect it to be much larger than Aware. |
+| **Lead Routed** | `salesforce.lead` | Distinct accounts with ≥1 lead routed via LeanData in the month. Only counts leads after conversion to an account — pre-conversion leads aren't attached to an account yet. |
+| **Opp Created** | `salesforce.opportunity` | Distinct accounts with ≥1 qualifying new opp created in the month. Qualifying = New Business or Expansion, not Rejected, known record type (Strategic / HV / Expansion). |
+| **Opp Qualified** | `salesforce.opportunity` | Distinct accounts with ≥1 opp that has moved past nTop's `1 - Qualification` stage (current stage used as a proxy). "Qualified" means the opp was accepted into active pipeline — includes opps at any stage from `2 - Discovery` onward, and also Closed Lost (they were previously accepted). This count grows over time as pipeline matures — that's expected, not a bug. Full accuracy requires `opportunity_history` and is part of the cohort model rebuild. |
+| **Closed Won** | `salesforce.opportunity` | Distinct accounts with ≥1 closed won opp, grouped by close date month. |
+
+**Notes:**
+- All counts are distinct accounts, not opp or contact counts, so stages are comparable.
+- Aware and Engaged come from Deepline's pre-aggregated model and can't currently be filtered by account segment — that requires the cohort model rebuild.
+- Contact Created through Closed Won can be filtered by segment, region, and industry using the filters below.
+- **These are calendar-month totals** (what happened across the full business in a given month), not paid-media cohort tracking (following the specific accounts from the Aware stage forward). Cohort tracking is the next rebuild — it requires account-level aware data from Deepline. Until then, Contact Created will be larger than Aware because it counts all new contacts across all channels.
+    """)
+    st.caption("Stage definitions are from the Funnel Analysis spec, May 2026.")
 
 
 # Authentication (reuses same service account as the budget pacer)
@@ -140,9 +207,12 @@ def load_opp_outcomes_by_month(months_back: int = 12) -> pd.DataFrame:
     record_type_list = "', '".join(RECORD_TYPE_LABELS.keys())
     query = f"""
     SELECT
-        DATE_TRUNC(DATE(created_date), MONTH) AS month_start,
+        DATE_TRUNC(DATE(opp.created_date), MONTH) AS month_start,
         opp.record_type_id,
         opp.type,
+        COALESCE(af.account_segment, 'Unknown') AS account_segment,
+        COALESCE(af.region, 'Unknown') AS region,
+        COALESCE(af.industry_vertical, 'Unknown') AS industry_vertical,
         COUNT(*) AS opp_count,
         COUNTIF(opp.is_closed = TRUE) AS opps_closed,
         COUNTIF(opp.is_won = TRUE) AS opps_won,
@@ -150,14 +220,17 @@ def load_opp_outcomes_by_month(months_back: int = 12) -> pd.DataFrame:
         ROUND(SUM(COALESCE(opf.new_expansion_arr, 0)), 2) AS new_expansion_arr,
         COUNTIF(COALESCE(opf.arr, 0) > 0) AS opps_with_arr
     FROM `{OPP_TABLE}` opp
-LEFT JOIN `bi-ntop.google_sheets.opportunity_fields` opf
-  ON opp.id = opf.opportunity_id
+    LEFT JOIN `bi-ntop.google_sheets.opportunity_fields` opf
+        ON opp.id = opf.opportunity_id
+    LEFT JOIN `bi-ntop.google_sheets.account_fields` af
+        ON opp.account_id = af._18_digit_account_id
     WHERE opp._fivetran_deleted = FALSE
       AND opp.created_date >= TIMESTAMP(DATE_TRUNC(DATE_SUB(CURRENT_DATE(), INTERVAL @months_back MONTH), MONTH))
       AND opp.stage_name != 'Rejected'
       AND opp.type IN ('New Business', 'Expansion', 'Renewal/Expansion')
       AND opp.record_type_id IN ('{record_type_list}')
-    GROUP BY month_start, opp.record_type_id, opp.type
+    GROUP BY month_start, opp.record_type_id, opp.type,
+             af.account_segment, af.region, af.industry_vertical
     ORDER BY month_start, record_type_id, type
     """
     job_config = bigquery.QueryJobConfig(
@@ -169,6 +242,18 @@ LEFT JOIN `bi-ntop.google_sheets.opportunity_fields` opf
     df = client.query(query, job_config=job_config).to_dataframe(create_bqstorage_client=False)
     df["month_start"] = pd.to_datetime(df["month_start"]).dt.date
 
+    # Strip "a. " / "b. " etc. sort-prefixes from account_segment values,
+    # and map "Missing Info" (z. prefix) to Unknown.
+    # Raw values look like: "a. Strategic", "b. Enterprise", "z. Missing Info"
+    df["account_segment"] = (
+        df["account_segment"]
+        .str.replace(r"^[a-z]\.\s+", "", regex=True)
+        .replace("Missing Info", "Unknown")
+    )
+
+    # Normalize region outliers (country names, city entries) to canonical region buckets.
+    df["region"] = df["region"].map(lambda r: REGION_NORMALIZE.get(r, r))
+
     # Bucket into Strategic / HV / Expansion. Expansion type wins over record_type label
     # (e.g. an HV-record-type-id but Expansion type is an Expansion).
     def bucket(row):
@@ -176,6 +261,116 @@ LEFT JOIN `bi-ntop.google_sheets.opportunity_fields` opf
             return "Expansion"
         return RECORD_TYPE_LABELS.get(row["record_type_id"], "Other")
     df["segment"] = df.apply(bucket, axis=1)
+    return df
+
+
+@st.cache_data(ttl=3600)
+def load_middle_lower_funnel_by_month(months_back: int = 18) -> pd.DataFrame:
+    """
+    Monthly distinct-account counts for the middle and lower funnel stages.
+    These are calendar-month counts — how many accounts hit each stage in that month.
+    Cohort-based tracking (following a first-aware cohort forward) requires account-level
+    Deepline data and is a future rebuild.
+
+    Sources and field assumptions:
+    - Contact Created: hubspot.contact — createdate field, property_salesforceaccountid for SF link
+    - Lead Routed: salesforce.lead — lean_data_routing_action_c (LeanData custom field),
+      converted_account_id (only populated after LeanData conversion, per spec)
+    - Opp Created / Opp Qualified / Closed Won: salesforce.opportunity
+
+    Opp Qualified uses current stage_name as a proxy. The spec flags opportunity_history
+    as the accurate source; that's a future improvement once the cohort model is built.
+    """
+    record_type_list = "', '".join(RECORD_TYPE_LABELS.keys())
+    query = f"""
+    WITH
+    contact_created AS (
+        SELECT
+            DATE_TRUNC(DATE(property_createdate), MONTH) AS month_start,
+            COUNT(DISTINCT property_salesforceaccountid) AS accounts_contact_created
+        FROM `bi-ntop.hubspot.contact`
+        WHERE _fivetran_deleted = FALSE
+          AND property_salesforceaccountid IS NOT NULL
+          AND property_createdate >= TIMESTAMP(DATE_TRUNC(DATE_SUB(CURRENT_DATE(), INTERVAL @months_back MONTH), MONTH))
+        GROUP BY month_start
+    ),
+    lead_routed AS (
+        SELECT
+            DATE_TRUNC(DATE(created_date), MONTH) AS month_start,
+            COUNT(DISTINCT converted_account_id) AS accounts_lead_routed
+        FROM `bi-ntop.salesforce.lead`
+        WHERE _fivetran_deleted = FALSE
+          AND lean_data_routing_action_c IS NOT NULL
+          AND converted_account_id IS NOT NULL
+          AND created_date >= TIMESTAMP(DATE_TRUNC(DATE_SUB(CURRENT_DATE(), INTERVAL @months_back MONTH), MONTH))
+        GROUP BY month_start
+    ),
+    opp_created AS (
+        SELECT
+            DATE_TRUNC(DATE(created_date), MONTH) AS month_start,
+            COUNT(DISTINCT account_id) AS accounts_opp_created
+        FROM `bi-ntop.salesforce.opportunity`
+        WHERE _fivetran_deleted = FALSE
+          AND stage_name != 'Rejected'
+          AND type IN ('New Business', 'Expansion', 'Renewal/Expansion')
+          AND record_type_id IN ('{record_type_list}')
+          AND created_date >= TIMESTAMP(DATE_TRUNC(DATE_SUB(CURRENT_DATE(), INTERVAL @months_back MONTH), MONTH))
+        GROUP BY month_start
+    ),
+    opp_qualified AS (
+        -- Opps that have moved past nTop's "1 - Qualification" stage, grouped by created month.
+        -- Excludes opps still sitting in stage 1 (not yet accepted) and Rejected opps.
+        -- Includes Closed Lost — those were accepted into pipeline even if they didn't win.
+        -- This number grows over time as pipeline matures — expected behavior.
+        SELECT
+            DATE_TRUNC(DATE(created_date), MONTH) AS month_start,
+            COUNT(DISTINCT account_id) AS accounts_opp_qualified
+        FROM `bi-ntop.salesforce.opportunity`
+        WHERE _fivetran_deleted = FALSE
+          AND stage_name NOT IN ('1 - Qualification', 'Rejected')
+          AND type IN ('New Business', 'Expansion', 'Renewal/Expansion')
+          AND record_type_id IN ('{record_type_list}')
+          AND created_date >= TIMESTAMP(DATE_TRUNC(DATE_SUB(CURRENT_DATE(), INTERVAL @months_back MONTH), MONTH))
+        GROUP BY month_start
+    ),
+    closed_won AS (
+        SELECT
+            DATE_TRUNC(close_date, MONTH) AS month_start,
+            COUNT(DISTINCT account_id) AS accounts_closed_won
+        FROM `bi-ntop.salesforce.opportunity`
+        WHERE _fivetran_deleted = FALSE
+          AND is_won = TRUE
+          AND type IN ('New Business', 'Expansion', 'Renewal/Expansion')
+          AND record_type_id IN ('{record_type_list}')
+          AND close_date >= DATE_TRUNC(DATE_SUB(CURRENT_DATE(), INTERVAL @months_back MONTH), MONTH)
+        GROUP BY month_start
+    )
+    SELECT
+        m.month_start,
+        COALESCE(cc.accounts_contact_created, 0) AS accounts_contact_created,
+        COALESCE(lr.accounts_lead_routed, 0)      AS accounts_lead_routed,
+        COALESCE(oc.accounts_opp_created, 0)      AS accounts_opp_created,
+        COALESCE(oq.accounts_opp_qualified, 0)    AS accounts_opp_qualified,
+        COALESCE(cw.accounts_closed_won, 0)       AS accounts_closed_won
+    FROM (
+        SELECT DATE_TRUNC(DATE_SUB(CURRENT_DATE(), INTERVAL n MONTH), MONTH) AS month_start
+        FROM UNNEST(GENERATE_ARRAY(0, @months_back - 1)) AS n
+    ) m
+    LEFT JOIN contact_created cc ON m.month_start = cc.month_start
+    LEFT JOIN lead_routed      lr ON m.month_start = lr.month_start
+    LEFT JOIN opp_created      oc ON m.month_start = oc.month_start
+    LEFT JOIN opp_qualified    oq ON m.month_start = oq.month_start
+    LEFT JOIN closed_won       cw ON m.month_start = cw.month_start
+    ORDER BY m.month_start
+    """
+    job_config = bigquery.QueryJobConfig(
+        query_parameters=[
+            bigquery.ScalarQueryParameter("months_back", "INT64", months_back),
+        ]
+    )
+    client = get_bq_client()
+    df = client.query(query, job_config=job_config).to_dataframe(create_bqstorage_client=False)
+    df["month_start"] = pd.to_datetime(df["month_start"]).dt.date
     return df
 
 
@@ -202,9 +397,10 @@ def fmt_count(value) -> str:
 
 # Load all data once
 try:
-    spend_df = load_spend_by_channel_month(months_back=18)
+    spend_df  = load_spend_by_channel_month(months_back=18)
     funnel_df = load_lifecycle_funnel_by_channel_month(months_back=18)
-    opp_df = load_opp_outcomes_by_month(months_back=18)
+    opp_df    = load_opp_outcomes_by_month(months_back=18)
+    mf_df     = load_middle_lower_funnel_by_month(months_back=18)
 except Exception as e:
     st.error(f"Failed to load data: {type(e).__name__}: {e}")
     st.stop()
@@ -214,7 +410,8 @@ except Exception as e:
 today = date.today()
 default_month = previous_full_month(today)
 available_months = sorted(
-    set(spend_df["month_start"]) | set(funnel_df["month_start"]) | set(opp_df["month_start"]),
+    set(spend_df["month_start"]) | set(funnel_df["month_start"])
+    | set(opp_df["month_start"]) | set(mf_df["month_start"]),
     reverse=True,
 )
 if default_month not in available_months:
@@ -228,19 +425,42 @@ selected_month = st.selectbox(
 )
 
 st.caption(
-    "Funnel data: aware, engaged, MQA, SQA from Deepline's marketing_lifecycle_funnel model. "
-    "Opp data: New Business + Expansion opps created in the selected month from Salesforce, "
-    "bucketed Strategic / HV / Expansion via record_type_id. "
-    "ARR is sourced from google_sheets.opportunity_fields and is only populated on ~19% of opps "
-    "(typically those past early qualification stages)."
+    "Aware and Engaged: Deepline's marketing_lifecycle_funnel model (definitions TBC — see stage definitions above). "
+    "Contact Created through Closed Won: HubSpot and Salesforce direct. "
+    "Opp outcomes bucketed Strategic / HV / Expansion via record_type_id. "
+    "ARR from google_sheets.opportunity_fields (~19% of opps have ARR populated)."
 )
 
+# Filters — apply to opp outcomes only; upper funnel requires cohort model to filter
+st.markdown("**Filters** — apply to opp outcomes section. Aware/Engaged filtering requires the cohort model rebuild.")
+_fcol1, _fcol2, _fcol3 = st.columns(3)
+_seg_options  = ["All"] + sorted(s for s in opp_df["account_segment"].dropna().unique() if s and s != "Unknown")
+_reg_options  = ["All"] + sorted(r for r in opp_df["region"].dropna().unique() if r and r != "Unknown")
+_ind_options  = ["All"] + sorted(i for i in opp_df["industry_vertical"].dropna().unique() if i and i != "Unknown")
+sel_acct_seg  = _fcol1.selectbox("Account segment", _seg_options)
+sel_region    = _fcol2.selectbox("Region", _reg_options)
+sel_industry  = _fcol3.selectbox("Industry", _ind_options)
 
-def render_snapshot(month: date, label_prefix: str = "") -> None:
-    """Render the funnel + outcomes for one month. label_prefix is shown in headers when comparing."""
-    spend_month = spend_df[spend_df["month_start"] == month]
+opp_df_filtered = opp_df.copy()
+if sel_acct_seg != "All":
+    opp_df_filtered = opp_df_filtered[opp_df_filtered["account_segment"] == sel_acct_seg]
+if sel_region != "All":
+    opp_df_filtered = opp_df_filtered[opp_df_filtered["region"] == sel_region]
+if sel_industry != "All":
+    opp_df_filtered = opp_df_filtered[opp_df_filtered["industry_vertical"] == sel_industry]
+
+
+def render_snapshot(month: date, label_prefix: str = "", opp_data: pd.DataFrame = None) -> None:
+    """
+    Render the full funnel + outcomes for one month.
+    opp_data: pass a pre-filtered slice of opp_df (segment/region/industry filters applied).
+              Defaults to the global opp_df if not provided.
+    """
+    spend_month  = spend_df[spend_df["month_start"] == month]
     funnel_month = funnel_df[funnel_df["month_start"] == month]
-    opp_month = opp_df[opp_df["month_start"] == month]
+    mf_month     = mf_df[mf_df["month_start"] == month]
+    opp_month    = (opp_data if opp_data is not None else opp_df)
+    opp_month    = opp_month[opp_month["month_start"] == month]
 
     # Funnel section
     header = f"Funnel, {month.strftime('%B %Y')}"
@@ -248,51 +468,51 @@ def render_snapshot(month: date, label_prefix: str = "") -> None:
         header = f"{label_prefix} — {header}"
     st.subheader(header)
 
-    # Cohort age label — helps Andrew/Kevin judge how mature the down-funnel numbers are
+    # Cohort age — helps Andrew/Kevin judge how mature down-funnel numbers are
     cohort_age_days = (today - month).days
     if month == today.replace(day=1):
-        st.caption(
-            f"Current month — {cohort_age_days} days in progress. "
-            "Down-funnel stages are incomplete."
-        )
+        st.caption(f"Current month — {cohort_age_days} days in progress. Down-funnel stages are incomplete.")
     elif cohort_age_days < 90:
         st.caption(
             f"{month.strftime('%B %Y')} cohort — {cohort_age_days} days old. "
-            "Opp creation data is still maturing (typically stabilizes around 90 days)."
+            "Opp creation data still maturing (stabilizes ~90 days)."
         )
     elif cohort_age_days < 365:
         st.caption(
             f"{month.strftime('%B %Y')} cohort — {cohort_age_days} days old. "
-            "Closed Won data is still maturing (typically stabilizes around 12 months)."
+            "Closed Won still maturing (stabilizes ~12 months)."
         )
     else:
-        st.caption(
-            f"{month.strftime('%B %Y')} cohort — {cohort_age_days} days old. "
-            "Cohort is reasonably mature."
-        )
+        st.caption(f"{month.strftime('%B %Y')} cohort — {cohort_age_days} days old. Reasonably mature.")
 
     paid_funnel = funnel_month[
         funnel_month["channel_group"].isin(["LinkedIn", "Google", "Microsoft", "Other Paid"])
     ]
-    total_spend = spend_month["spend"].sum()
-    total_aware = paid_funnel["accounts_aware"].sum()
+    total_spend   = spend_month["spend"].sum()
+    total_aware   = paid_funnel["accounts_aware"].sum()
     total_engaged = paid_funnel["accounts_engaged"].sum()
-    total_mqa = paid_funnel["accounts_mqa"].sum()
-    total_sqa = paid_funnel["accounts_sqa"].sum()
+    mf_row        = mf_month.iloc[0] if not mf_month.empty else {}
 
-    fc1, fc2, fc3, fc4, fc5 = st.columns(5)
-    fc1.metric("Paid Spend", fmt_money(total_spend))
-    fc2.metric("Aware accounts", fmt_count(total_aware))
-    fc3.metric("Engaged", fmt_count(total_engaged))
-    fc4.metric("MQA", fmt_count(total_mqa))
-    fc5.metric("SQA", fmt_count(total_sqa))
+    # Row 1: Spend → Aware → Engaged → Contact Created
+    r1c1, r1c2, r1c3, r1c4 = st.columns(4)
+    r1c1.metric("Paid Spend",       fmt_money(total_spend))
+    r1c2.metric("Aware",            fmt_count(total_aware))
+    r1c3.metric("Engaged",          fmt_count(total_engaged))
+    r1c4.metric("Contact Created",  fmt_count(mf_row.get("accounts_contact_created", 0)))
 
-    st.markdown("**By paid channel**")
+    # Row 2: Lead Routed → Opp Created → Opp Qualified → Closed Won
+    r2c1, r2c2, r2c3, r2c4 = st.columns(4)
+    r2c1.metric("Lead Routed",    fmt_count(mf_row.get("accounts_lead_routed", 0)))
+    r2c2.metric("Opp Created",    fmt_count(mf_row.get("accounts_opp_created", 0)))
+    r2c3.metric("Opp Qualified",  fmt_count(mf_row.get("accounts_opp_qualified", 0)))
+    r2c4.metric("Closed Won",     fmt_count(mf_row.get("accounts_closed_won", 0)))
+
+    # Channel breakdown — Aware and Engaged only (channel attribution stops here;
+    # Contact Created onward has no paid-channel dimension in current data)
+    st.markdown("**Aware & Engaged by paid channel**")
     channel_view = paid_funnel.groupby("channel_group", as_index=False).agg({
         "accounts_aware": "sum",
         "accounts_engaged": "sum",
-        "accounts_mqa": "sum",
-        "accounts_sqa": "sum",
     })
     spend_by_channel = spend_month.groupby("platform", as_index=False).agg({"spend": "sum"})
     platform_to_channel = {
@@ -306,31 +526,23 @@ def render_snapshot(month: date, label_prefix: str = "") -> None:
         spend_by_channel["platform"].map(platform_to_channel).fillna("Other Paid")
     )
     spend_by_channel = spend_by_channel.groupby("channel_group", as_index=False).agg({"spend": "sum"})
-
     channel_view = channel_view.merge(spend_by_channel, on="channel_group", how="left")
     channel_view["spend"] = channel_view["spend"].fillna(0)
-    channel_view = channel_view[[
-        "channel_group", "spend", "accounts_aware", "accounts_engaged", "accounts_mqa", "accounts_sqa"
-    ]]
+    channel_view = channel_view[["channel_group", "spend", "accounts_aware", "accounts_engaged"]]
     channel_view = channel_view.rename(columns={
         "channel_group": "Channel",
         "spend": "Spend ($)",
         "accounts_aware": "Aware",
         "accounts_engaged": "Engaged",
-        "accounts_mqa": "MQA",
-        "accounts_sqa": "SQA",
     })
-
     st.dataframe(
         channel_view,
         hide_index=True,
         use_container_width=True,
         column_config={
             "Spend ($)": st.column_config.NumberColumn(format="$%.0f"),
-            "Aware": st.column_config.NumberColumn(format="%d"),
-            "Engaged": st.column_config.NumberColumn(format="%d"),
-            "MQA": st.column_config.NumberColumn(format="%d"),
-            "SQA": st.column_config.NumberColumn(format="%d"),
+            "Aware":     st.column_config.NumberColumn(format="%d"),
+            "Engaged":   st.column_config.NumberColumn(format="%d"),
         },
     )
 
@@ -411,13 +623,12 @@ view_mode = st.radio(
 st.divider()
 
 if view_mode == "Single month":
-    render_snapshot(selected_month)
+    render_snapshot(selected_month, opp_data=opp_df_filtered)
 elif view_mode == "Month-over-month":
     available_for_comparison = [m for m in available_months if m != selected_month]
     if not available_for_comparison:
         st.warning("Need at least two months of data to compare.")
     else:
-        comparison_default = available_for_comparison[0]
         comparison_month = st.selectbox(
             "Compare to",
             options=available_for_comparison,
@@ -428,9 +639,9 @@ elif view_mode == "Month-over-month":
         st.divider()
         col_left, col_right = st.columns(2)
         with col_left:
-            render_snapshot(selected_month, label_prefix="A")
+            render_snapshot(selected_month, label_prefix="A", opp_data=opp_df_filtered)
         with col_right:
-            render_snapshot(comparison_month, label_prefix="B")
+            render_snapshot(comparison_month, label_prefix="B", opp_data=opp_df_filtered)
 
 else:  # Trend over time
     # Use the last 18 months ascending so the chart reads left to right
@@ -473,20 +684,31 @@ else:  # Trend over time
         icon="ℹ️",
     )
 
-    trend_fig = go.Figure()
+    # Also build the middle/lower funnel trend spine
+    mf_trend = mf_df.groupby("month_start", as_index=False).agg({
+        "accounts_contact_created": "sum",
+        "accounts_lead_routed":     "sum",
+        "accounts_opp_created":     "sum",
+        "accounts_opp_qualified":   "sum",
+        "accounts_closed_won":      "sum",
+    })
+    mf_trend = _spine.merge(
+        mf_trend[mf_trend["month_start"].isin(trend_months)],
+        on="month_start", how="left",
+    )
 
-    def add_line(df, x_col, y_col, name, color):
-        # Split into mature and maturing halves so we can color them differently
-        mature = df[df[x_col] < maturity_cutoff]
+    def add_line(fig, df, x_col, y_col, name, color):
+        """Add a solid (mature) + dotted/faded (maturing) line pair to fig."""
+        mature   = df[df[x_col] < maturity_cutoff]
         maturing = df[df[x_col] >= maturity_cutoff]
         if not mature.empty:
-            trend_fig.add_trace(go.Scatter(
+            fig.add_trace(go.Scatter(
                 x=mature[x_col], y=mature[y_col], name=name,
                 mode="lines+markers", line=dict(color=color, width=3),
                 legendgroup=name, showlegend=True,
             ))
         if not maturing.empty:
-            trend_fig.add_trace(go.Scatter(
+            fig.add_trace(go.Scatter(
                 x=maturing[x_col], y=maturing[y_col], name=name,
                 mode="lines+markers",
                 line=dict(color=color, width=3, dash="dot"),
@@ -495,20 +717,38 @@ else:  # Trend over time
                 legendgroup=name, showlegend=False,
             ))
 
-    add_line(funnel_trend, "month_start", "accounts_aware", "Aware", "#0047FF")
-    add_line(funnel_trend, "month_start", "accounts_engaged", "Engaged", "#34A853")
-    add_line(funnel_trend, "month_start", "accounts_mqa", "MQA", "#F5A623")
-    add_line(funnel_trend, "month_start", "accounts_sqa", "SQA", "#1a1a1a")
-
-    trend_fig.update_layout(
-        height=400,
+    # Upper funnel chart — Aware and Engaged (Deepline)
+    upper_fig = go.Figure()
+    add_line(upper_fig, funnel_trend, "month_start", "accounts_aware",   "Aware",   "#0047FF")
+    add_line(upper_fig, funnel_trend, "month_start", "accounts_engaged", "Engaged", "#34A853")
+    upper_fig.update_layout(
+        height=320,
         margin=dict(l=40, r=40, t=20, b=40),
         yaxis=dict(title="Accounts"),
         xaxis=dict(title=None),
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
         hovermode="x unified",
     )
-    st.plotly_chart(trend_fig, use_container_width=True)
+    st.markdown("**Aware & Engaged (Deepline)**")
+    st.plotly_chart(upper_fig, use_container_width=True)
+
+    # Lower funnel chart — Contact Created → Closed Won (HubSpot + Salesforce)
+    lower_fig = go.Figure()
+    add_line(lower_fig, mf_trend, "month_start", "accounts_contact_created", "Contact Created", "#7B61FF")
+    add_line(lower_fig, mf_trend, "month_start", "accounts_lead_routed",     "Lead Routed",     "#FF6B35")
+    add_line(lower_fig, mf_trend, "month_start", "accounts_opp_created",     "Opp Created",     "#0047FF")
+    add_line(lower_fig, mf_trend, "month_start", "accounts_opp_qualified",   "Opp Qualified",   "#F5A623")
+    add_line(lower_fig, mf_trend, "month_start", "accounts_closed_won",      "Closed Won",      "#34A853")
+    lower_fig.update_layout(
+        height=320,
+        margin=dict(l=40, r=40, t=20, b=40),
+        yaxis=dict(title="Accounts"),
+        xaxis=dict(title=None),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        hovermode="x unified",
+    )
+    st.markdown("**Contact Created → Closed Won (HubSpot & Salesforce)**")
+    st.plotly_chart(lower_fig, use_container_width=True)
 
     # Spend trend below
     st.markdown("**Paid spend by month**")
