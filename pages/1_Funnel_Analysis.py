@@ -410,36 +410,26 @@ st.caption(
     "ARR from google_sheets.opportunity_fields (~19% of opps have ARR populated)."
 )
 
-# Filters — apply to opp outcomes only; upper funnel requires cohort model to filter
-st.markdown("**Filters** — apply to opp outcomes section. Aware/Engaged filtering requires the cohort model rebuild.")
-_fcol1, _fcol2, _fcol3 = st.columns(3)
-_seg_options  = ["All"] + sorted(s for s in opp_df["account_segment"].dropna().unique() if s and s != "Unknown")
-_reg_options  = ["All"] + sorted(r for r in opp_df["region"].dropna().unique() if r and r != "Unknown")
-_ind_options  = ["All"] + sorted(i for i in opp_df["industry_vertical"].dropna().unique() if i and i != "Unknown")
-sel_acct_seg  = _fcol1.selectbox("Account segment", _seg_options)
-sel_region    = _fcol2.selectbox("Geography", _reg_options)
-sel_industry  = _fcol3.selectbox("Industry", _ind_options)
 
-opp_df_filtered = opp_df.copy()
-if sel_acct_seg != "All":
-    opp_df_filtered = opp_df_filtered[opp_df_filtered["account_segment"] == sel_acct_seg]
-if sel_region != "All":
-    opp_df_filtered = opp_df_filtered[opp_df_filtered["region"] == sel_region]
-if sel_industry != "All":
-    opp_df_filtered = opp_df_filtered[opp_df_filtered["industry_vertical"] == sel_industry]
-
-
-def render_snapshot(month: date, label_prefix: str = "", opp_data: pd.DataFrame = None) -> None:
+def render_snapshot(
+    month: date,
+    label_prefix: str = "",
+    opp_pre_filtered: pd.DataFrame | None = None,
+    key_suffix: str = "",
+) -> None:
     """
     Render the full funnel + outcomes for one month.
-    opp_data: pass a pre-filtered slice of opp_df (segment/region/industry filters applied).
-              Defaults to the global opp_df if not provided.
+
+    opp_pre_filtered: pass an already-filtered opp_df slice (e.g. from MoM shared filters).
+                      When None (single-month mode), filter widgets are rendered inline
+                      just above the outcomes section.
+    key_suffix: appended to widget keys to avoid Streamlit duplicate-key errors when this
+                function is called more than once per page (MoM mode).
     """
     spend_month  = spend_df[spend_df["month_start"] == month]
     funnel_month = funnel_df[funnel_df["month_start"] == month]
     mf_month     = mf_df[mf_df["month_start"] == month]
-    opp_month    = (opp_data if opp_data is not None else opp_df)
-    opp_month    = opp_month[opp_month["month_start"] == month]
+    # opp_month is resolved later, just before the outcomes section
 
     # Funnel section
     header = f"Funnel, {month.strftime('%B %Y')}"
@@ -525,11 +515,40 @@ def render_snapshot(month: date, label_prefix: str = "", opp_data: pd.DataFrame 
         },
     )
 
-    # Outcomes section
+    # ── Outcomes section ─────────────────────────────────────────────────────
+    st.divider()
     outcomes_header = f"Outcomes, {month.strftime('%B %Y')}"
     if label_prefix:
         outcomes_header = f"{label_prefix} — {outcomes_header}"
     st.markdown(f"**{outcomes_header}**")
+
+    # Filters live here, right above the outcomes numbers.
+    # In single-month mode (opp_pre_filtered is None) we render widgets inline.
+    # In MoM mode the caller renders one shared filter block and passes the
+    # result in as opp_pre_filtered, so we skip the widgets here.
+    if opp_pre_filtered is None:
+        _fc1, _fc2, _fc3 = st.columns(3)
+        _seg_opts = ["All"] + sorted(
+            s for s in opp_df["account_segment"].dropna().unique() if s and s != "Unknown"
+        )
+        _reg_opts = ["All"] + sorted(
+            r for r in opp_df["region"].dropna().unique() if r and r != "Unknown"
+        )
+        _ind_opts = ["All"] + sorted(
+            i for i in opp_df["industry_vertical"].dropna().unique() if i and i != "Unknown"
+        )
+        _sel_seg = _fc1.selectbox("Account segment", _seg_opts, key=f"seg_{key_suffix}")
+        _sel_geo = _fc2.selectbox("Geography",        _reg_opts, key=f"geo_{key_suffix}")
+        _sel_ind = _fc3.selectbox("Industry",         _ind_opts, key=f"ind_{key_suffix}")
+        opp_month = opp_df[opp_df["month_start"] == month].copy()
+        if _sel_seg != "All":
+            opp_month = opp_month[opp_month["account_segment"] == _sel_seg]
+        if _sel_geo != "All":
+            opp_month = opp_month[opp_month["region"] == _sel_geo]
+        if _sel_ind != "All":
+            opp_month = opp_month[opp_month["industry_vertical"] == _sel_ind]
+    else:
+        opp_month = opp_pre_filtered[opp_pre_filtered["month_start"] == month]
 
     outcomes = opp_month.groupby("segment", as_index=False).agg({
         "opp_count": "sum",
@@ -602,7 +621,9 @@ view_mode = st.radio(
 st.divider()
 
 if view_mode == "Single month":
-    render_snapshot(selected_month, opp_data=opp_df_filtered)
+    # Filters render inline inside render_snapshot, right above outcomes
+    render_snapshot(selected_month, key_suffix="sm")
+
 elif view_mode == "Month-over-month":
     available_for_comparison = [m for m in available_months if m != selected_month]
     if not available_for_comparison:
@@ -616,11 +637,35 @@ elif view_mode == "Month-over-month":
             key="comparison_month",
         )
         st.divider()
+        # One shared filter block for both columns — you want to compare the same
+        # segment/geo/industry across the two months, not filter each independently
+        st.markdown("**Outcomes filters**")
+        _mc1, _mc2, _mc3 = st.columns(3)
+        _m_seg_opts = ["All"] + sorted(
+            s for s in opp_df["account_segment"].dropna().unique() if s and s != "Unknown"
+        )
+        _m_reg_opts = ["All"] + sorted(
+            r for r in opp_df["region"].dropna().unique() if r and r != "Unknown"
+        )
+        _m_ind_opts = ["All"] + sorted(
+            i for i in opp_df["industry_vertical"].dropna().unique() if i and i != "Unknown"
+        )
+        _m_sel_seg = _mc1.selectbox("Account segment", _m_seg_opts, key="mom_seg")
+        _m_sel_geo = _mc2.selectbox("Geography",        _m_reg_opts, key="mom_geo")
+        _m_sel_ind = _mc3.selectbox("Industry",         _m_ind_opts, key="mom_ind")
+        _mom_filtered = opp_df.copy()
+        if _m_sel_seg != "All":
+            _mom_filtered = _mom_filtered[_mom_filtered["account_segment"] == _m_sel_seg]
+        if _m_sel_geo != "All":
+            _mom_filtered = _mom_filtered[_mom_filtered["region"] == _m_sel_geo]
+        if _m_sel_ind != "All":
+            _mom_filtered = _mom_filtered[_mom_filtered["industry_vertical"] == _m_sel_ind]
+
         col_left, col_right = st.columns(2)
         with col_left:
-            render_snapshot(selected_month, label_prefix="A", opp_data=opp_df_filtered)
+            render_snapshot(selected_month, label_prefix="A", opp_pre_filtered=_mom_filtered)
         with col_right:
-            render_snapshot(comparison_month, label_prefix="B", opp_data=opp_df_filtered)
+            render_snapshot(comparison_month, label_prefix="B", opp_pre_filtered=_mom_filtered)
 
 else:  # Trend over time
     # Use the last 18 months ascending so the chart reads left to right
@@ -751,8 +796,30 @@ else:  # Trend over time
     st.plotly_chart(spend_fig, use_container_width=True)
 
     # Outcomes trend: opp counts by segment, stacked
+    st.divider()
     st.markdown("**Opp outcomes by month**")
-    outcomes_trend = opp_df[opp_df["month_start"].isin(trend_months)].copy()
+    # Filters right above the chart
+    _tc1, _tc2, _tc3 = st.columns(3)
+    _t_seg_opts = ["All"] + sorted(
+        s for s in opp_df["account_segment"].dropna().unique() if s and s != "Unknown"
+    )
+    _t_reg_opts = ["All"] + sorted(
+        r for r in opp_df["region"].dropna().unique() if r and r != "Unknown"
+    )
+    _t_ind_opts = ["All"] + sorted(
+        i for i in opp_df["industry_vertical"].dropna().unique() if i and i != "Unknown"
+    )
+    _t_sel_seg = _tc1.selectbox("Account segment", _t_seg_opts, key="trend_seg")
+    _t_sel_geo = _tc2.selectbox("Geography",        _t_reg_opts, key="trend_geo")
+    _t_sel_ind = _tc3.selectbox("Industry",         _t_ind_opts, key="trend_ind")
+    _trend_opp = opp_df.copy()
+    if _t_sel_seg != "All":
+        _trend_opp = _trend_opp[_trend_opp["account_segment"] == _t_sel_seg]
+    if _t_sel_geo != "All":
+        _trend_opp = _trend_opp[_trend_opp["region"] == _t_sel_geo]
+    if _t_sel_ind != "All":
+        _trend_opp = _trend_opp[_trend_opp["industry_vertical"] == _t_sel_ind]
+    outcomes_trend = _trend_opp[_trend_opp["month_start"].isin(trend_months)].copy()
     outcomes_pivot = outcomes_trend.pivot_table(
         index="month_start", columns="segment", values="opp_count", aggfunc="sum"
     ).fillna(0).reset_index()
