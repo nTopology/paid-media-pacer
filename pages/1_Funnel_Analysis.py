@@ -15,9 +15,10 @@ from google.oauth2 import service_account
 # Configuration
 SERVICE_ACCOUNT_FILE = "service-account.json"
 GCP_PROJECT = "bi-ntop"
-AD_TABLE = "bi-ntop.aero_prod_ad_reporting.ad_reporting__account_report"
-FUNNEL_TABLE = "bi-ntop.aero_prod.marketing_lifecycle_funnel"
-OPP_TABLE = "bi-ntop.salesforce.opportunity"
+AD_TABLE          = "bi-ntop.aero_prod_ad_reporting.ad_reporting__account_report"
+AD_CAMPAIGN_TABLE = "bi-ntop.aero_prod_ad_reporting.ad_reporting__campaign_report"
+FUNNEL_TABLE      = "bi-ntop.aero_prod.marketing_lifecycle_funnel"
+OPP_TABLE         = "bi-ntop.salesforce.opportunity"
 
 # Record type IDs from project doc, verified against real data
 RECORD_TYPE_LABELS = {
@@ -45,16 +46,6 @@ _US_RAW_REGIONS: frozenset[str] = frozenset({
 })
 
 # Channels we care about in the funnel view (rest get lumped as "Other")
-PAID_CHANNEL_MAP = {
-    ("Paid Social", "linkedin_ads"): "LinkedIn",
-    ("Warm Outbound", "linkedin_ads"): "LinkedIn",
-    ("Paid Search", "google_ads"): "Google",
-    ("Paid Search", "microsoft_ads"): "Microsoft",
-    ("Paid Social", "facebook_ads"): "Other Paid",
-    ("Paid Social", "twitter_ads"): "Other Paid",
-    ("Paid Display", None): "Other Paid",
-    ("Other Advertising", None): "Other Paid",
-}
 
 
 # Page setup
@@ -102,18 +93,36 @@ def get_bq_client():
 
 # Data loaders
 @st.cache_data(ttl=3600)
-def load_spend_by_channel_month(months_back: int = 12) -> pd.DataFrame:
-    """Monthly paid media spend by platform for the last N months."""
+def load_spend_by_channel_month(months_back: int = 18) -> pd.DataFrame:
+    """
+    Monthly paid media spend by channel group, sourced from campaign-level data
+    so YouTube can be split from Google Search.
+
+    YouTube detection: campaign_name ILIKE '%video%' on google_ads.
+    LinkedIn campaigns don't need a split — all map to 'LinkedIn'.
+
+    channel_group values in the result:
+        'LinkedIn'       — all linkedin_ads campaigns
+        'Google Search'  — google_ads campaigns whose name does NOT contain 'video'
+        'YouTube'        — google_ads campaigns whose name contains 'video'
+        other platforms  — kept as raw platform string for historical months
+    """
     query = f"""
     SELECT
         DATE_TRUNC(date_day, MONTH) AS month_start,
-        platform,
+        CASE
+            WHEN platform = 'linkedin_ads'                              THEN 'LinkedIn'
+            WHEN platform = 'google_ads'
+             AND LOWER(campaign_name) LIKE '%video%'                   THEN 'YouTube'
+            WHEN platform = 'google_ads'                               THEN 'Google Search'
+            ELSE platform
+        END AS channel_group,
         ROUND(SUM(spend), 2) AS spend
-    FROM `{AD_TABLE}`
+    FROM `{AD_CAMPAIGN_TABLE}`
     WHERE date_day >= DATE_TRUNC(DATE_SUB(CURRENT_DATE(), INTERVAL @months_back MONTH), MONTH)
       AND spend > 0
-    GROUP BY month_start, platform
-    ORDER BY month_start, platform
+    GROUP BY month_start, channel_group
+    ORDER BY month_start, channel_group
     """
     job_config = bigquery.QueryJobConfig(
         query_parameters=[
@@ -156,13 +165,30 @@ def load_lifecycle_funnel_by_channel_month(months_back: int = 12) -> pd.DataFram
     df = client.query(query, job_config=job_config).to_dataframe(create_bqstorage_client=False)
     df["month_start"] = pd.to_datetime(df["month_start"]).dt.date
 
-    # Group raw channel/platform into the buckets we display
+    # Classify each Deepline row into a channel group.
+    #
+    # LinkedIn: rows explicitly tagged with linkedin_ads platform.
+    # Google:   rows tagged with google_ads platform, PLUS "Paid Search" rows
+    #           with null platform (Deepline drops the platform tag on some rows;
+    #           Google is the only active paid search platform in 2026 so these
+    #           are attributed here rather than buried in Non-Paid).
+    # Non-Paid: everything else — organic, email, direct, events, (Other), etc.
+    #           These go into the "Other influenced" table, not the paid table.
+    #
+    # No "Other Paid" bucket: Microsoft and Reddit have $0 spend in 2026.
+    # If they reactivate, add them back explicitly rather than via a catch-all.
     def bucket(row):
-        return PAID_CHANNEL_MAP.get(
-            (row["channel"], row["platform"]),
-            "Non-Paid" if row["channel"] not in ("Paid Social", "Paid Search", "Paid Display", "Other Advertising")
-            else "Other Paid"
-        )
+        ch, pl = row["channel"], row["platform"]
+        if pl == "linkedin_ads" and ch in ("Paid Social", "Warm Outbound"):
+            return "LinkedIn"
+        if pl == "google_ads" and ch == "Paid Search":
+            return "Google"
+        if pl is None and ch == "Paid Search":
+            # Paid Search with missing platform tag.  Only active search platform
+            # in 2026 is Google, so classify here.  Revisit if Microsoft reactivates.
+            return "Google"
+        return "Non-Paid"
+
     df["channel_group"] = df.apply(bucket, axis=1)
     return df
 
@@ -454,9 +480,7 @@ def render_snapshot(
     else:
         st.caption(f"{month.strftime('%B %Y')} cohort — {cohort_age_days} days old. Reasonably mature.")
 
-    paid_funnel = funnel_month[
-        funnel_month["channel_group"].isin(["LinkedIn", "Google", "Microsoft", "Other Paid"])
-    ]
+    paid_funnel = funnel_month[funnel_month["channel_group"].isin(["LinkedIn", "Google"])]
     total_spend   = spend_month["spend"].sum()
     total_aware   = paid_funnel["accounts_aware"].sum()
     total_engaged = paid_funnel["accounts_engaged"].sum()
@@ -476,44 +500,107 @@ def render_snapshot(
     r2c3.metric("Opp Qualified",  fmt_count(mf_row.get("accounts_opp_qualified", 0)))
     r2c4.metric("Closed Won",     fmt_count(mf_row.get("accounts_closed_won", 0)))
 
-    # Channel breakdown — Aware and Engaged only (channel attribution stops here;
-    # Contact Created onward has no paid-channel dimension in current data)
-    st.markdown("**Aware & Engaged by paid channel**")
-    channel_view = paid_funnel.groupby("channel_group", as_index=False).agg({
-        "accounts_aware": "sum",
-        "accounts_engaged": "sum",
-    })
-    spend_by_channel = spend_month.groupby("platform", as_index=False).agg({"spend": "sum"})
-    platform_to_channel = {
-        "linkedin_ads": "LinkedIn",
-        "google_ads": "Google",
-        "microsoft_ads": "Microsoft",
-        "reddit_ads": "Other Paid",
-        "facebook_ads": "Other Paid",
-    }
-    spend_by_channel["channel_group"] = (
-        spend_by_channel["platform"].map(platform_to_channel).fillna("Other Paid")
-    )
-    spend_by_channel = spend_by_channel.groupby("channel_group", as_index=False).agg({"spend": "sum"})
-    channel_view = channel_view.merge(spend_by_channel, on="channel_group", how="left")
-    channel_view["spend"] = channel_view["spend"].fillna(0)
-    channel_view = channel_view[["channel_group", "spend", "accounts_aware", "accounts_engaged"]]
-    channel_view = channel_view.rename(columns={
-        "channel_group": "Channel",
-        "spend": "Spend ($)",
-        "accounts_aware": "Aware",
-        "accounts_engaged": "Engaged",
-    })
-    st.dataframe(
-        channel_view,
-        hide_index=True,
-        use_container_width=True,
-        column_config={
-            "Spend ($)": st.column_config.NumberColumn(format="$%.0f"),
-            "Aware":     st.column_config.NumberColumn(format="%d"),
-            "Engaged":   st.column_config.NumberColumn(format="%d"),
-        },
-    )
+    # ── Paid channel table ────────────────────────────────────────────────────
+    # Only channels with actual spend in this month.
+    # Google is split into Search and YouTube by campaign name (contains 'video').
+    # Attribution (Aware/Engaged) comes from Deepline; spend from the campaign table.
+    # Deepline doesn't expose campaign IDs, so Google attribution can't be split
+    # by campaign type — all Google-attributed accounts appear on the Search row.
+    st.markdown("**Paid channels — Aware & Engaged**")
+
+    paid_rows = []
+
+    # LinkedIn
+    lk_funnel = funnel_month[funnel_month["channel_group"] == "LinkedIn"]
+    lk_spend  = spend_month[spend_month["channel_group"] == "LinkedIn"]["spend"].sum()
+    if lk_spend > 0:
+        paid_rows.append({
+            "Channel": "LinkedIn",
+            "Spend ($)": lk_spend,
+            "Aware":   int(lk_funnel["accounts_aware"].sum()),
+            "Engaged": int(lk_funnel["accounts_engaged"].sum()),
+        })
+
+    # Google — spend split by campaign type; attribution shows combined total
+    search_spend = spend_month[spend_month["channel_group"] == "Google Search"]["spend"].sum()
+    yt_spend     = spend_month[spend_month["channel_group"] == "YouTube"]["spend"].sum()
+    goo_funnel   = funnel_month[funnel_month["channel_group"] == "Google"]
+    goo_aware    = int(goo_funnel["accounts_aware"].sum())
+    goo_engaged  = int(goo_funnel["accounts_engaged"].sum())
+    google_split = (search_spend > 0 and yt_spend > 0)  # both active → need footnote
+
+    if search_spend > 0:
+        paid_rows.append({
+            "Channel":  "Google Search" + (" †" if google_split else ""),
+            "Spend ($)": search_spend,
+            "Aware":    goo_aware,    # full google_ads total — can't split by campaign type
+            "Engaged":  goo_engaged,
+        })
+    if yt_spend > 0:
+        paid_rows.append({
+            "Channel":  "YouTube" + (" †" if google_split else ""),
+            "Spend ($)": yt_spend,
+            "Aware":    None,  # same accounts as Google Search row above; not double-counted
+            "Engaged":  None,
+        })
+
+    if paid_rows:
+        st.dataframe(
+            pd.DataFrame(paid_rows),
+            hide_index=True,
+            use_container_width=True,
+            column_config={
+                "Spend ($)": st.column_config.NumberColumn(format="$%.0f"),
+                "Aware":     st.column_config.NumberColumn(format="%d"),
+                "Engaged":   st.column_config.NumberColumn(format="%d"),
+            },
+        )
+        if google_split:
+            st.caption(
+                "† Deepline's attribution links accounts to google_ads but not to individual "
+                "campaigns, so the Google/YouTube split can't be applied to Aware/Engaged. "
+                f"Google total this month: {goo_aware:,} aware, {goo_engaged:,} engaged — "
+                "shown on the Google Search row. YouTube row shows spend only."
+            )
+    else:
+        st.caption("No paid channel spend in this month.")
+
+    # ── Other influenced channels (non-paid) ─────────────────────────────────
+    # Deepline attributes accounts to channels beyond paid — organic search, email,
+    # direct, events, etc.  These are real signals but structurally have $0 spend,
+    # so they don't belong in the paid table.
+    non_paid = funnel_month[funnel_month["channel_group"] == "Non-Paid"].copy()
+    if not non_paid.empty:
+        other_view = (
+            non_paid.groupby("channel", as_index=False)
+            .agg(accounts_aware="sum", accounts_engaged="sum")
+            .query("accounts_aware > 0 or accounts_engaged > 0")
+            .sort_values("accounts_aware", ascending=False)
+        )
+        # Give Deepline's anonymous catch-all a more descriptive label
+        other_view["channel"] = other_view["channel"].replace(
+            "(Other)", "(Unattributed — Deepline catch-all)"
+        )
+        other_view = other_view.rename(columns={
+            "channel":           "Channel",
+            "accounts_aware":    "Aware",
+            "accounts_engaged":  "Engaged",
+        })
+        st.markdown("**Other influenced channels (non-paid, no spend)**")
+        st.caption(
+            "Deepline attributes these accounts to non-paid touch-points. "
+            "No spend column because there's no paid budget behind them. "
+            "Kept separate so they don't inflate the paid CPA."
+        )
+        st.dataframe(
+            other_view,
+            hide_index=True,
+            use_container_width=True,
+            column_config={
+                "Aware":   st.column_config.NumberColumn(format="%d"),
+                "Engaged": st.column_config.NumberColumn(format="%d"),
+            },
+        )
 
     # ── Outcomes section ─────────────────────────────────────────────────────
     st.divider()
@@ -672,9 +759,7 @@ else:  # Trend over time
     trend_months = sorted(set(funnel_df["month_start"]))[-18:]
 
     # Build a wide table: rows = month, cols = stages, values = totals across paid channels
-    paid_only = funnel_df[
-        funnel_df["channel_group"].isin(["LinkedIn", "Google", "Microsoft", "Other Paid"])
-    ]
+    paid_only = funnel_df[funnel_df["channel_group"].isin(["LinkedIn", "Google"])]
     funnel_trend = paid_only.groupby("month_start", as_index=False).agg({
         "accounts_aware": "sum",
         "accounts_engaged": "sum",
