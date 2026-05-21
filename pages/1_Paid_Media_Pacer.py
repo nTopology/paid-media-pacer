@@ -141,14 +141,17 @@ GOOGLE_DEFAULT = (0.0, 1.0)  # Any other Google campaign with spend = 100% HV
 # Authentication
 @st.cache_resource
 def get_credentials():
-    """Load the service account credentials from the local JSON key file."""
+    scopes = [
+        "https://www.googleapis.com/auth/cloud-platform",
+        "https://www.googleapis.com/auth/spreadsheets.readonly",
+        "https://www.googleapis.com/auth/drive.readonly",
+    ]
+    if "gcp_service_account" in st.secrets:
+        return service_account.Credentials.from_service_account_info(
+            st.secrets["gcp_service_account"], scopes=scopes
+        )
     return service_account.Credentials.from_service_account_file(
-        SERVICE_ACCOUNT_FILE,
-        scopes=[
-            "https://www.googleapis.com/auth/cloud-platform",
-            "https://www.googleapis.com/auth/spreadsheets.readonly",
-            "https://www.googleapis.com/auth/drive.readonly",
-        ],
+        SERVICE_ACCOUNT_FILE, scopes=scopes
     )
 
 

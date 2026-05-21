@@ -234,9 +234,13 @@ st.markdown(
 # ── Auth ───────────────────────────────────────────────────────────────────────
 @st.cache_resource
 def get_credentials():
+    scopes = ["https://www.googleapis.com/auth/cloud-platform"]
+    if "gcp_service_account" in st.secrets:
+        return service_account.Credentials.from_service_account_info(
+            st.secrets["gcp_service_account"], scopes=scopes
+        )
     return service_account.Credentials.from_service_account_file(
-        SERVICE_ACCOUNT_FILE,
-        scopes=["https://www.googleapis.com/auth/cloud-platform"],
+        SERVICE_ACCOUNT_FILE, scopes=scopes
     )
 
 
