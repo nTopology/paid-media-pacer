@@ -144,9 +144,11 @@ def load_opp_outcomes_by_month(months_back: int = 12) -> pd.DataFrame:
         opp.record_type_id,
         opp.type,
         COUNT(*) AS opp_count,
+        COUNTIF(opp.is_closed = TRUE) AS opps_closed,
+        COUNTIF(opp.is_won = TRUE) AS opps_won,
         ROUND(SUM(COALESCE(opf.arr, 0)), 2) AS total_arr,
-ROUND(SUM(COALESCE(opf.new_expansion_arr, 0)), 2) AS new_expansion_arr,
-COUNTIF(COALESCE(opf.arr, 0) > 0) AS opps_with_arr
+        ROUND(SUM(COALESCE(opf.new_expansion_arr, 0)), 2) AS new_expansion_arr,
+        COUNTIF(COALESCE(opf.arr, 0) > 0) AS opps_with_arr
     FROM `{OPP_TABLE}` opp
 LEFT JOIN `bi-ntop.google_sheets.opportunity_fields` opf
   ON opp.id = opf.opportunity_id
@@ -200,9 +202,9 @@ def fmt_count(value) -> str:
 
 # Load all data once
 try:
-    spend_df = load_spend_by_channel_month(months_back=12)
-    funnel_df = load_lifecycle_funnel_by_channel_month(months_back=12)
-    opp_df = load_opp_outcomes_by_month(months_back=12)
+    spend_df = load_spend_by_channel_month(months_back=18)
+    funnel_df = load_lifecycle_funnel_by_channel_month(months_back=18)
+    opp_df = load_opp_outcomes_by_month(months_back=18)
 except Exception as e:
     st.error(f"Failed to load data: {type(e).__name__}: {e}")
     st.stop()
@@ -245,6 +247,29 @@ def render_snapshot(month: date, label_prefix: str = "") -> None:
     if label_prefix:
         header = f"{label_prefix} — {header}"
     st.subheader(header)
+
+    # Cohort age label — helps Andrew/Kevin judge how mature the down-funnel numbers are
+    cohort_age_days = (today - month).days
+    if month == today.replace(day=1):
+        st.caption(
+            f"Current month — {cohort_age_days} days in progress. "
+            "Down-funnel stages are incomplete."
+        )
+    elif cohort_age_days < 90:
+        st.caption(
+            f"{month.strftime('%B %Y')} cohort — {cohort_age_days} days old. "
+            "Opp creation data is still maturing (typically stabilizes around 90 days)."
+        )
+    elif cohort_age_days < 365:
+        st.caption(
+            f"{month.strftime('%B %Y')} cohort — {cohort_age_days} days old. "
+            "Closed Won data is still maturing (typically stabilizes around 12 months)."
+        )
+    else:
+        st.caption(
+            f"{month.strftime('%B %Y')} cohort — {cohort_age_days} days old. "
+            "Cohort is reasonably mature."
+        )
 
     paid_funnel = funnel_month[
         funnel_month["channel_group"].isin(["LinkedIn", "Google", "Microsoft", "Other Paid"])
@@ -317,6 +342,8 @@ def render_snapshot(month: date, label_prefix: str = "") -> None:
 
     outcomes = opp_month.groupby("segment", as_index=False).agg({
         "opp_count": "sum",
+        "opps_closed": "sum",
+        "opps_won": "sum",
         "total_arr": "sum",
         "new_expansion_arr": "sum",
         "opps_with_arr": "sum",
@@ -326,7 +353,8 @@ def render_snapshot(month: date, label_prefix: str = "") -> None:
             outcomes = pd.concat([
                 outcomes,
                 pd.DataFrame([{
-                    "segment": segment, "opp_count": 0, "total_arr": 0,
+                    "segment": segment, "opp_count": 0, "opps_closed": 0,
+                    "opps_won": 0, "total_arr": 0,
                     "new_expansion_arr": 0, "opps_with_arr": 0,
                 }]),
             ], ignore_index=True)
@@ -336,13 +364,40 @@ def render_snapshot(month: date, label_prefix: str = "") -> None:
 
     oc1, oc2, oc3 = st.columns(3)
     for col, (_, row) in zip([oc1, oc2, oc3], outcomes.iterrows()):
-        seg = row["segment"]
         col.metric(
-            f"{seg} opps",
+            f"{row['segment']} opps",
             fmt_count(row["opp_count"]),
             f"{fmt_money(row['total_arr'])} ARR ({int(row['opps_with_arr'])} of {int(row['opp_count'])} with ARR)",
             delta_color="off",
         )
+
+    wc1, wc2, wc3 = st.columns(3)
+    for col, (_, row) in zip([wc1, wc2, wc3], outcomes.iterrows()):
+        opps_closed = int(row["opps_closed"])
+        opps_won = int(row["opps_won"])
+        opps_lost = opps_closed - opps_won
+        opps_with_arr = int(row["opps_with_arr"])
+
+        # Guard: hide win rate if cohort is under 90 days old or fewer than 5 closed opps —
+        # a single closed deal reads as 100% which is more misleading than no number
+        if cohort_age_days < 90 or opps_closed < 5:
+            win_rate_display = "N/A — too early"
+        else:
+            win_rate_display = f"{opps_won / opps_closed:.0%}"
+
+        col.metric(
+            f"{row['segment']} win rate",
+            win_rate_display,
+            f"{opps_won} won / {opps_lost} lost of {opps_closed} closed",
+            delta_color="off",
+        )
+
+        # Guard: hide avg deal size if fewer than 3 opps have ARR populated
+        if opps_with_arr < 3:
+            col.caption(f"Avg deal: N/A ({opps_with_arr} of {int(row['opp_count'])} opps have ARR)")
+        else:
+            avg_deal = row["total_arr"] / opps_with_arr
+            col.caption(f"Avg deal: {fmt_money(avg_deal)} ({opps_with_arr} opps with ARR)")
 
 
 # View selector
@@ -378,8 +433,8 @@ elif view_mode == "Month-over-month":
             render_snapshot(comparison_month, label_prefix="B")
 
 else:  # Trend over time
-    # Use the last 12 months ascending so the chart reads left to right
-    trend_months = sorted(set(funnel_df["month_start"]))[-12:]
+    # Use the last 18 months ascending so the chart reads left to right
+    trend_months = sorted(set(funnel_df["month_start"]))[-18:]
 
     # Build a wide table: rows = month, cols = stages, values = totals across paid channels
     paid_only = funnel_df[
@@ -393,7 +448,7 @@ else:  # Trend over time
     })
     spend_trend = spend_df.groupby("month_start", as_index=False).agg({"spend": "sum"})
 
-    # Reindex both tables to the full 12-month spine so months with no paid data
+    # Reindex both tables to the full 18-month spine so months with no paid data
     # still appear on the x-axis (as gaps / zero bars) rather than being dropped silently
     _spine = pd.DataFrame({"month_start": trend_months})
     funnel_trend = _spine.merge(
@@ -408,7 +463,7 @@ else:  # Trend over time
     # The most recent 3 months are "still maturing" for cohort purposes
     maturity_cutoff = trend_months[-3] if len(trend_months) >= 3 else trend_months[0]
 
-    st.subheader("Funnel trend, last 12 months")
+    st.subheader("Funnel trend, last 18 months")
     st.info(
         f"**The last 3 months ({trend_months[-3].strftime('%b')}, "
         f"{trend_months[-2].strftime('%b')}, "
@@ -485,7 +540,7 @@ else:  # Trend over time
     for segment in ["Strategic", "HV", "Expansion"]:
         if segment not in outcomes_pivot.columns:
             outcomes_pivot[segment] = 0
-    # Guarantee all 12 trend months appear on the x-axis even if a month has no qualifying opps
+    # Guarantee all 18 trend months appear on the x-axis even if a month has no qualifying opps
     outcomes_pivot = (
         pd.DataFrame({"month_start": trend_months})
         .merge(outcomes_pivot, on="month_start", how="left")

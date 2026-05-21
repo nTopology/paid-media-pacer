@@ -32,14 +32,21 @@ Can you confirm whether this is a known gap or a labeling issue we should accoun
 
 ---
 
-## 3. Lifecycle stage ordering doesn't behave like a funnel
+## 3. Stage definitions and ordering: what do MQA and SQA actually mean?
 
 **Table:** `bi-ntop.aero_prod.marketing_lifecycle_funnel`  
 **Fields:** `accounts_aware`, `accounts_engaged`, `accounts_mqa`, `accounts_sqa`
 
-In some months, `accounts_mqa` is higher than `accounts_aware` for the same channel and period. A traditional funnel requires each stage to be equal to or smaller than the one above it.
+We're displaying these four fields as funnel stages in the dashboard, but we don't have confirmed definitions for what MQA and SQA mean in the context of this model. Specific questions:
 
-We've worked around this by showing absolute counts only (no conversion rate between stages), which is fine for our purposes. But we want to make sure we're interpreting the model correctly — are these cumulative counts, point-in-time snapshots, or something else? And is the stage ordering expected to be non-monotonic?
+- **Aware**: is this an account that received an ad impression? Visited the site? Something else?
+- **Engaged**: clicked an ad? Spent time on site? Multi-touch threshold?
+- **MQA**: what scoring threshold or signal triggers this? Is it nTop's standard MQA definition or Deepline's own?
+- **SQA**: is this equivalent to an SQL/SAL at nTop? How does it relate to LeanData routing?
+
+We're also seeing `accounts_mqa` higher than `accounts_aware` for the same channel and period in some months. A traditional funnel requires each downstream stage to be smaller than the one above it. Are these cumulative counts, point-in-time snapshots, or something else? Is the non-monotonic ordering expected behavior?
+
+We've worked around this by showing absolute counts only (no conversion rates between stages), but confirming the definitions would let us label these stages correctly for an executive audience.
 
 ---
 
@@ -53,13 +60,13 @@ Is there a more reliable field or join path for attributing an account's first p
 
 ---
 
-## 5. No account segment in the lifecycle funnel (Strategic vs. HV split not possible)
+## 5. Aware/Engaged can't be filtered by account segment
 
 **Table:** `bi-ntop.aero_prod.marketing_lifecycle_funnel`
 
-The funnel model rolls up at the channel grain but doesn't carry an account segment field (Strategic vs. High Velocity). This means we can't show a Strategic-only or HV-only funnel view in the dashboard — we can only show all paid channels combined.
+The funnel model rolls up at the channel grain with no account segment field. Segment, region, and industry filters (from `google_sheets.account_fields`) will work for the Salesforce-based stages (Opp Created onward) once the cohort model is built, because those join on account IDs we control. But Aware and Engaged can't be filtered by segment until Deepline either adds a segment dimension to this model or provides account-level rows we can join against `account_fields` ourselves.
 
-We've noted this as a limitation in the dashboard. If Deepline ever adds a segment dimension to the model, this becomes possible without any dashboard rework.
+The dashboard will show segment filters on Opp stages first, then extend to Aware/Engaged if Deepline adds the dimension.
 
 ---
 
@@ -84,13 +91,32 @@ This isn't a Deepline question per se (it's a Salesforce config question), but f
 
 ---
 
+## 7. Account-level funnel data needed for cohort model
+
+**Table:** `bi-ntop.aero_prod.marketing_lifecycle_funnel`
+
+The next major version of the dashboard will track **account cohorts** — grouping accounts by the month they first appeared in the aware stage, then following that group forward through every subsequent funnel stage over time. This is a fundamentally different model from the current approach (which just counts whatever happened in a given calendar month).
+
+Building this requires one row per account with a first-aware timestamp — not pre-aggregated counts. The current table as we're querying it groups by `channel`, `platform`, and `report_week` with no `account_id` field visible.
+
+Before we can build the cohort model, we need to know:
+
+1. Does `marketing_lifecycle_funnel` (or a related table in `aero_prod`) have **account-level rows** with per-account stage timestamps or first-touch dates?
+2. If not, is there a separate table — something like an `account_funnel_history` or `account_stage_events` — we should be using instead?
+3. If the current table is the right source, what field contains the account identifier, and how is the first-aware month defined for a given account?
+
+This is the most important open question for the dashboard rebuild.
+
+---
+
 ## Summary table
 
 | # | Issue | Impact on dashboard | Resolution needed from |
 |---|---|---|---|
 | 1 | `accounts_opp` 21x inflated vs Salesforce | Not using it; showing SF direct instead | Deepline — what does this field count? |
 | 2 | February 2026 paid-channel gap | Line chart shows a gap that month | Deepline — known gap or labeling issue? |
-| 3 | Funnel stages non-monotonic | Showing absolute counts only, no conversion % | Deepline — confirm expected behavior |
+| 3 | MQA/SQA definitions unknown; stages non-monotonic | Showing absolute counts only, no conversion %; stages mislabeled for exec audience | Deepline — confirm definitions and expected behavior |
 | 4 | `marketing_lead_source_c` too sparse | No channel-level attribution above opp stage | Deepline — is there a better path? |
 | 5 | No segment dimension in funnel model | Can't split Strategic vs HV in funnel view | Deepline — future enhancement request |
 | 6 | Unknown `record_type_id` `0124R000001UuQIQAK` | Those opps excluded from dashboard | Salesforce admin — which segment? |
+| 7 | No account-level funnel data confirmed | Cohort model rebuild blocked | Deepline — **highest priority** |
