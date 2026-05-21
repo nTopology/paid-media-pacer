@@ -313,7 +313,6 @@ def _to_date(df: pd.DataFrame, col: str) -> pd.DataFrame:
 
 
 # ── KPI Summary (trailing 30 days) ────────────────────────────────────────────
-@st.cache_data(ttl=3600)
 def load_kpi_summary(as_of: date) -> dict:
     """Returns {metric: (current_30d_value, prior_30d_value)} for the four headline KPIs."""
     t30_end   = as_of
