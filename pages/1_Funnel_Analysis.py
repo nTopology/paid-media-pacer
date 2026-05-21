@@ -393,16 +393,29 @@ else:  # Trend over time
     })
     spend_trend = spend_df.groupby("month_start", as_index=False).agg({"spend": "sum"})
 
-    funnel_trend = funnel_trend[funnel_trend["month_start"].isin(trend_months)]
-    spend_trend = spend_trend[spend_trend["month_start"].isin(trend_months)]
+    # Reindex both tables to the full 12-month spine so months with no paid data
+    # still appear on the x-axis (as gaps / zero bars) rather than being dropped silently
+    _spine = pd.DataFrame({"month_start": trend_months})
+    funnel_trend = _spine.merge(
+        funnel_trend[funnel_trend["month_start"].isin(trend_months)],
+        on="month_start", how="left",
+    )  # missing months stay as NaN → Plotly shows a visible gap in the line
+    spend_trend = _spine.merge(
+        spend_trend[spend_trend["month_start"].isin(trend_months)],
+        on="month_start", how="left",
+    ).fillna(0)
 
     # The most recent 3 months are "still maturing" for cohort purposes
     maturity_cutoff = trend_months[-3] if len(trend_months) >= 3 else trend_months[0]
 
     st.subheader("Funnel trend, last 12 months")
-    st.caption(
-        "Most recent 3 months shown faded — opps and SQA from these months are still maturing. "
-        "Treat as directional only."
+    st.info(
+        f"**The last 3 months ({trend_months[-3].strftime('%b')}, "
+        f"{trend_months[-2].strftime('%b')}, "
+        f"{trend_months[-1].strftime('%b %Y')}) are shown faded** because deals and "
+        "upper-funnel accounts from those months are still being created. "
+        "Use them as a directional signal, not a final number.",
+        icon="ℹ️",
     )
 
     trend_fig = go.Figure()
@@ -465,10 +478,6 @@ else:  # Trend over time
 
     # Outcomes trend: opp counts by segment, stacked
     st.markdown("**Opp outcomes by month**")
-    st.caption(
-        "Stacked bar by segment. Recent months faded because opp pipeline from these months "
-        "is still being created and may grow."
-    )
     outcomes_trend = opp_df[opp_df["month_start"].isin(trend_months)].copy()
     outcomes_pivot = outcomes_trend.pivot_table(
         index="month_start", columns="segment", values="opp_count", aggfunc="sum"
@@ -476,6 +485,12 @@ else:  # Trend over time
     for segment in ["Strategic", "HV", "Expansion"]:
         if segment not in outcomes_pivot.columns:
             outcomes_pivot[segment] = 0
+    # Guarantee all 12 trend months appear on the x-axis even if a month has no qualifying opps
+    outcomes_pivot = (
+        pd.DataFrame({"month_start": trend_months})
+        .merge(outcomes_pivot, on="month_start", how="left")
+        .fillna(0)
+    )
 
     outcomes_fig = go.Figure()
     seg_colors = {"Strategic": "#0047FF", "HV": "#F5A623", "Expansion": "#34A853"}
@@ -485,16 +500,8 @@ else:  # Trend over time
             x=outcomes_pivot["month_start"],
             y=outcomes_pivot[segment],
             name=segment,
-            marker_color=[
-                seg_colors[segment] if mature else f"rgba(0,0,0,0)"
-                for mature in mature_mask
-            ],
-            # Use a fainter version for maturing months by adjusting opacity per bar
             marker=dict(
-                color=[
-                    seg_colors[segment] if mature else seg_colors[segment]
-                    for mature in mature_mask
-                ],
+                color=seg_colors[segment],
                 opacity=[1.0 if mature else 0.4 for mature in mature_mask],
             ),
         ))
