@@ -28,52 +28,21 @@ RECORD_TYPE_LABELS = {
     "0124R000001JIhxQAG": "Expansion",
 }
 
-# Region normalization — maps country names, city entries, and sub-region variants
-# back to the canonical region buckets used in account_fields.
-# All values not in this map pass through unchanged.
-REGION_NORMALIZE: dict[str, str] = {
-    # North America catch-alls
-    "Americas":                         "North America",
-    "USA - East":                       "North America",
-    "USA":                              "North America",
-    "United States":                    "North America",
-    "United states":                    "North America",
-    "New York, New York":               "North America",
-    "New York":                         "North America",
-    "Virginia, USA":                    "North America",
-    "Huntsville, Alabama":              "North America",
-    "Atlanta Georgia":                  "North America",
-    # Central America (Mexico entries)
-    "Monterrey, Nuevo Leon, Mexico":    "Central America",
-    "Chihuahua, Mexico":                "Central America",
-    "Queretaro Mexio":                  "Central America",
-    # South America
-    "Colombia":                         "South America",
-    "Chile":                            "South America",
-    "Argentina":                        "South America",
-    # Europe
-    "Germany":                          "Western Europe",
-    "France":                           "Western Europe",
-    "Europe":                           "Western Europe",
-    "EMEA":                             "Western Europe",
-    "United Kingdom":                   "Northern Europe",
-    "Norway":                           "Northern Europe",
-    "Central Europe":                   "Eastern Europe",
-    "EMEA East":                        "Eastern Europe",
-    "Russia":                           "Eastern Europe",
-    "Southern Europe - Bosnia & Herzegovina": "Southern Europe",
-    # Middle East
-    "Middle East - Turkey":             "Middle East",
-    # Asia-Pacific
-    "Japan":                            "East Asia",
-    "China":                            "East Asia",
-    "Hong Kong":                        "East Asia",
-    "East Asia/US":                     "East Asia",
-    "East Asia - South Korea":          "East Asia",
-    "India":                            "South Asia",
-    "South Asia - India":               "South Asia",
-    "New Zealand":                      "Australia",
-}
+# All raw region values in account_fields that represent US-based accounts.
+# Everything not in this set becomes "International".
+_US_RAW_REGIONS: frozenset[str] = frozenset({
+    "North America",
+    "Americas",
+    "USA - East",
+    "USA",
+    "United States",
+    "United states",
+    "New York, New York",
+    "New York",
+    "Virginia, USA",
+    "Huntsville, Alabama",
+    "Atlanta Georgia",
+})
 
 # Channels we care about in the funnel view (rest get lumped as "Other")
 PAID_CHANNEL_MAP = {
@@ -377,8 +346,10 @@ def normalize_opp_df(df: pd.DataFrame) -> pd.DataFrame:
         .str.replace(r"^[a-z]\.\s+", "", regex=True)
         .replace("Missing Info", "Unknown")
     )
-    # Normalize region outliers (country names, city entries) to canonical buckets.
-    df["region"] = df["region"].map(lambda r: REGION_NORMALIZE.get(r, r))
+    # Collapse region to a simple US / International split.
+    df["region"] = df["region"].map(
+        lambda r: "US" if r in _US_RAW_REGIONS else "International"
+    )
     return df
 
 
@@ -446,7 +417,7 @@ _seg_options  = ["All"] + sorted(s for s in opp_df["account_segment"].dropna().u
 _reg_options  = ["All"] + sorted(r for r in opp_df["region"].dropna().unique() if r and r != "Unknown")
 _ind_options  = ["All"] + sorted(i for i in opp_df["industry_vertical"].dropna().unique() if i and i != "Unknown")
 sel_acct_seg  = _fcol1.selectbox("Account segment", _seg_options)
-sel_region    = _fcol2.selectbox("Region", _reg_options)
+sel_region    = _fcol2.selectbox("Geography", _reg_options)
 sel_industry  = _fcol3.selectbox("Industry", _ind_options)
 
 opp_df_filtered = opp_df.copy()
