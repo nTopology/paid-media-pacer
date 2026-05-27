@@ -1,0 +1,602 @@
+"""
+Event & Webinar Attribution — v1.0
+Net-new contacts attributed to HubSpot campaigns prefixed EV- (events) or WN- (webinars).
+Source buckets show where contacts came from before registering.
+"""
+
+from __future__ import annotations
+
+import base64
+import json
+from datetime import date
+from pathlib import Path
+
+import pandas as pd
+import plotly.graph_objects as go
+import requests
+import streamlit as st
+
+
+# ── Brand assets ───────────────────────────────────────────────────────────────
+_BRAND_DIR = Path(__file__).parent.parent / "static" / "brand"
+_LOGO_DIR  = Path(__file__).parent.parent / "static" / "logos"
+
+try:
+    _RAW = json.loads((_BRAND_DIR / "colors.json").read_text())
+    _C = {
+        "blue":       _RAW["accent"]["ntop_blue"]["hex"],
+        "black":      _RAW["primary"]["black"]["hex"],
+        "white":      _RAW["primary"]["white"]["hex"],
+        "green":      _RAW["signal_indicators"]["green"],
+        "red":        _RAW["signal_indicators"]["red"],
+        "gray_light": _RAW["neutrals_optional"]["gray_light"],
+        "gray_mid":   _RAW["neutrals_optional"]["gray_mid"],
+        "gray_dark":  _RAW["neutrals_optional"]["gray_dark"],
+    }
+except Exception:
+    _C = {
+        "blue": "#248AFF", "black": "#000000", "white": "#FFFFFF",
+        "green": "#1FA34E", "red": "#D43F3F",
+        "gray_light": "#E5E5E5", "gray_mid": "#999999", "gray_dark": "#333333",
+    }
+
+_SVG_FILE = _LOGO_DIR / "nTop-Logo_Light-theme.svg"
+_PNG_FILE  = _LOGO_DIR / "nTop-Logo_Light-theme_400w.png"
+
+if _SVG_FILE.exists():
+    _logo_b64      = base64.b64encode(_SVG_FILE.read_bytes()).decode()
+    _LOGO_IMG_HTML = (
+        f'<img src="data:image/svg+xml;base64,{_logo_b64}" '
+        f'height="54" style="display:block;flex-shrink:0;">'
+    )
+elif _PNG_FILE.exists():
+    _logo_b64      = base64.b64encode(_PNG_FILE.read_bytes()).decode()
+    _LOGO_IMG_HTML = (
+        f'<img src="data:image/png;base64,{_logo_b64}" '
+        f'height="54" style="display:block;flex-shrink:0;">'
+    )
+else:
+    _LOGO_IMG_HTML = (
+        f'<span style="font-family:Oswald,sans-serif;font-weight:700;'
+        f'font-size:22px;color:{_C["black"]};">nTop</span>'
+    )
+
+
+# ── Brand CSS ──────────────────────────────────────────────────────────────────
+_BRAND_CSS = f"""
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Oswald:wght@700&family=IBM+Plex+Sans:wght@400;700&family=IBM+Plex+Mono&display=swap');
+
+html, body, .stApp, .stMarkdown, .stCaption, p {{
+    font-family: 'IBM Plex Sans', sans-serif;
+}}
+h1, h2, h3 {{
+    font-family: 'Oswald', sans-serif;
+    font-weight: 700;
+    color: {_C["black"]};
+}}
+section[data-testid="stSidebar"] label,
+section[data-testid="stSidebar"] p,
+section[data-testid="stSidebar"] div {{
+    font-family: 'IBM Plex Sans', sans-serif;
+}}
+.stAlert p, .stAlert div {{
+    font-family: 'IBM Plex Sans', sans-serif;
+    font-size: 14px;
+}}
+.ntop-header {{
+    display: flex;
+    align-items: center;
+    gap: 20px;
+    padding-bottom: 20px;
+    margin-bottom: 24px;
+    border-bottom: 2px solid {_C["black"]};
+}}
+.ntop-header-text {{
+    border-left: 1px solid {_C["gray_light"]};
+    padding-left: 20px;
+}}
+.ntop-page-title {{
+    font-family: 'Oswald', sans-serif;
+    font-weight: 700;
+    font-size: 26px;
+    color: {_C["black"]};
+    line-height: 1.15;
+    margin: 0 0 5px 0;
+}}
+.ntop-page-subtitle {{
+    font-family: 'IBM Plex Sans', sans-serif;
+    font-size: 13px;
+    color: {_C["gray_dark"]};
+    margin: 0;
+    line-height: 1.4;
+}}
+</style>
+"""
+
+
+# ── Constants ──────────────────────────────────────────────────────────────────
+HS_BASE       = "https://api.hubapi.com"
+METRICS_START = "2024-06-01"
+
+# Channel color palette (spec-defined)
+CHANNEL_COLORS: dict[str, str] = {
+    "Email marketing":   "#1D9E75",
+    "Organic search":    "#378ADD",
+    "Social media":      "#D4537E",
+    "Other campaigns":   "#7F77DD",
+    "Direct":            "#D85A30",
+    "Referrals / other": "#888780",
+}
+CHANNEL_ORDER = list(CHANNEL_COLORS.keys())
+
+
+# ── HubSpot API helpers ────────────────────────────────────────────────────────
+
+def _hs_token() -> str:
+    if "hubspot_api_token" in st.secrets:
+        return str(st.secrets["hubspot_api_token"])
+    import os
+    return os.environ.get("HUBSPOT_API_TOKEN", "")
+
+
+def _hs_headers() -> dict:
+    return {
+        "Authorization": f"Bearer {_hs_token()}",
+        "Content-Type":  "application/json",
+    }
+
+
+def _hs_get(path: str, params: dict | None = None) -> dict:
+    resp = requests.get(
+        f"{HS_BASE}{path}",
+        headers=_hs_headers(),
+        params=params or {},
+        timeout=30,
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
+def _hs_post(path: str, payload: dict) -> dict:
+    resp = requests.post(
+        f"{HS_BASE}{path}",
+        headers=_hs_headers(),
+        json=payload,
+        timeout=30,
+    )
+    resp.raise_for_status()
+    return resp.json()
+
+
+def _bucket_source(src: str) -> str:
+    s = (src or "").upper().strip()
+    if s == "EMAIL_MARKETING":
+        return "Email marketing"
+    if s == "ORGANIC_SEARCH":
+        return "Organic search"
+    if s in ("SOCIAL_MEDIA", "PAID_SOCIAL"):
+        return "Social media"
+    if s in ("OTHER_CAMPAIGNS", "PAID_SEARCH"):
+        return "Other campaigns"
+    if s == "DIRECT_TRAFFIC":
+        return "Direct"
+    return "Referrals / other"
+
+
+# ── Data fetchers ──────────────────────────────────────────────────────────────
+
+@st.cache_data(ttl=3600)
+def fetch_ev_wn_campaigns() -> list[dict]:
+    """Paginate /marketing/v3/campaigns and return only EV- and WN- campaigns."""
+    campaigns: list[dict] = []
+    after: str | None = None
+    while True:
+        params: dict = {"limit": 100}
+        if after:
+            params["after"] = after
+        data = _hs_get("/marketing/v3/campaigns", params)
+        for c in data.get("results", []):
+            name = c.get("name", "")
+            if name.startswith("EV-") or name.startswith("WN-"):
+                campaigns.append(c)
+        after = ((data.get("paging") or {}).get("next") or {}).get("after")
+        if not after:
+            break
+    return campaigns
+
+
+@st.cache_data(ttl=3600)
+def fetch_campaign_metrics(campaign_id: str) -> dict[str, int]:
+    """
+    Return newContactsFirstTouch and newContactsLastTouch counts.
+    Explicit date range is required — HubSpot defaults to the event day only
+    and returns zeros without it.
+    """
+    today_str = date.today().isoformat()
+    data = _hs_get(
+        f"/marketing/v3/campaigns/{campaign_id}/reports/metrics",
+        {"startDate": METRICS_START, "endDate": today_str},
+    )
+    result: dict[str, int] = {"newContactsFirstTouch": 0, "newContactsLastTouch": 0}
+
+    # Handle both list-of-metrics and flat-dict response shapes
+    metrics_raw = data.get("metrics") or data.get("results") or []
+    if isinstance(metrics_raw, list):
+        for m in metrics_raw:
+            key = m.get("metric") or m.get("name") or ""
+            if key in result:
+                result[key] = int(m.get("value", 0) or 0)
+    elif isinstance(metrics_raw, dict):
+        for key in result:
+            if key in metrics_raw:
+                result[key] = int(metrics_raw[key] or 0)
+
+    return result
+
+
+@st.cache_data(ttl=86400)
+def fetch_campaign_contacts_raw(campaign_id: str, attribution_type: str) -> list[dict]:
+    """
+    Fetch every contact attributed to this campaign via the given attribution type,
+    then batch-read their hs_analytics_source and email.
+
+    Returns list of {"domain": str, "bucket": str}.
+    Cached 24 h — potentially slow for campaigns with 1000+ contacts.
+    """
+    today_str   = date.today().isoformat()
+    contact_ids: list[str] = []
+    after: str | None = None
+
+    while True:
+        params: dict = {
+            "startDate": METRICS_START,
+            "endDate":   today_str,
+            "limit":     100,
+        }
+        if after:
+            params["after"] = after
+        try:
+            data = _hs_get(
+                f"/marketing/v3/campaigns/{campaign_id}/reports/contacts/{attribution_type}",
+                params,
+            )
+        except requests.HTTPError:
+            break
+        results = data.get("results", [])
+        for item in results:
+            cid = item.get("id") or item.get("contactId")
+            if cid:
+                contact_ids.append(str(cid))
+        after = ((data.get("paging") or {}).get("next") or {}).get("after")
+        if not after or not results:
+            break
+
+    if not contact_ids:
+        return []
+
+    contacts: list[dict] = []
+    for i in range(0, len(contact_ids), 100):
+        chunk = contact_ids[i : i + 100]
+        try:
+            resp = _hs_post(
+                "/crm/v3/objects/contacts/batch/read",
+                {
+                    "inputs":     [{"id": cid} for cid in chunk],
+                    "properties": ["hs_analytics_source", "hs_latest_source", "email"],
+                },
+            )
+            for contact in resp.get("results", []):
+                props  = contact.get("properties") or {}
+                src    = props.get("hs_analytics_source") or ""
+                email  = props.get("email") or ""
+                domain = email.split("@")[-1].lower() if "@" in email else ""
+                contacts.append({"domain": domain, "bucket": _bucket_source(src)})
+        except Exception:
+            pass
+
+    return contacts
+
+
+def _aggregate_sources(
+    contacts: list[dict],
+    target_domains: frozenset[str] = frozenset(),
+) -> dict[str, int]:
+    """Sum contacts by channel bucket, optionally restricted to target domains."""
+    buckets: dict[str, int] = {}
+    for c in contacts:
+        if target_domains and c["domain"] not in target_domains:
+            continue
+        b = c["bucket"]
+        buckets[b] = buckets.get(b, 0) + 1
+    return buckets
+
+
+# ── Page setup ─────────────────────────────────────────────────────────────────
+st.set_page_config(page_title="Event & Webinar Attribution", layout="wide")
+st.markdown(_BRAND_CSS, unsafe_allow_html=True)
+
+if _PNG_FILE.exists():
+    st.logo(str(_PNG_FILE))
+
+st.markdown(
+    f'<div class="ntop-header">'
+    f'{_LOGO_IMG_HTML}'
+    f'<div class="ntop-header-text">'
+    f'<div class="ntop-page-title">Event &amp; Webinar Attribution</div>'
+    f'<div class="ntop-page-subtitle">'
+    f'Net-new contacts attributed to EV- and WN- HubSpot campaigns. '
+    f'Source channels from <code>hs_analytics_source</code>. '
+    f'Date range: 2024-06-01 to today.'
+    f'</div></div></div>',
+    unsafe_allow_html=True,
+)
+
+
+# ── Sidebar — target account filter (stretch goal) ────────────────────────────
+target_domains: frozenset[str] = frozenset()
+
+with st.sidebar:
+    st.header("Target account filter")
+    st.caption(
+        "Upload Aerospace_Target_List.csv or Turbo_Target_List.csv. "
+        "Contacts are matched by email domain to a domain/website column in the CSV."
+    )
+    uploaded_files = st.file_uploader(
+        "Upload CSV(s)",
+        type=["csv"],
+        accept_multiple_files=True,
+        label_visibility="collapsed",
+    )
+    if uploaded_files:
+        raw_domains: set[str] = set()
+        for uf in uploaded_files:
+            try:
+                tmp = pd.read_csv(uf)
+                for col in tmp.columns:
+                    if any(k in col.lower() for k in ("domain", "website", "url")):
+                        for val in tmp[col].dropna().astype(str):
+                            v = val.strip().lower()
+                            for prefix in ("https://", "http://", "www."):
+                                v = v.removeprefix(prefix)
+                            v = v.split("/")[0]
+                            if "." in v:
+                                raw_domains.add(v)
+            except Exception as exc:
+                st.warning(f"{uf.name}: {exc}")
+        if raw_domains:
+            target_domains = frozenset(raw_domains)
+            st.success(f"{len(target_domains):,} target domains loaded.")
+        else:
+            st.warning("No domain/website column found in uploaded CSV(s).")
+
+    if target_domains:
+        st.divider()
+        with st.expander("Preview domains"):
+            st.write(sorted(target_domains)[:50])
+            if len(target_domains) > 50:
+                st.caption(f"… and {len(target_domains) - 50} more")
+
+
+# ── Controls ───────────────────────────────────────────────────────────────────
+ctrl1, ctrl2 = st.columns(2)
+with ctrl1:
+    campaign_type = st.radio(
+        "Campaign type",
+        ["All", "Events", "Webinars"],
+        horizontal=True,
+        index=0,
+    )
+with ctrl2:
+    attr_model = st.radio(
+        "Attribution model",
+        ["First touch", "Last touch"],
+        horizontal=True,
+        index=0,
+    )
+
+attr_hs_key = (
+    "NEW_CONTACTS_FIRST_TOUCH" if attr_model == "First touch" else "NEW_CONTACTS_LAST_TOUCH"
+)
+metric_key = (
+    "newContactsFirstTouch" if attr_model == "First touch" else "newContactsLastTouch"
+)
+
+
+# ── Load campaigns ─────────────────────────────────────────────────────────────
+with st.spinner("Fetching campaign list from HubSpot…"):
+    try:
+        all_campaigns = fetch_ev_wn_campaigns()
+    except Exception as exc:
+        st.error(f"Could not fetch campaigns: {exc}")
+        st.stop()
+
+if campaign_type == "Events":
+    campaigns = [c for c in all_campaigns if c.get("name", "").startswith("EV-")]
+elif campaign_type == "Webinars":
+    campaigns = [c for c in all_campaigns if c.get("name", "").startswith("WN-")]
+else:
+    campaigns = list(all_campaigns)
+
+if not campaigns:
+    st.info(
+        "No campaigns found. Check that HubSpot campaign names start with EV- or WN- "
+        "and that the API token has the marketing read scopes."
+    )
+    st.stop()
+
+
+# ── Fetch campaign metrics (fast, 1 h cache) ───────────────────────────────────
+campaign_rows: list[dict] = []
+metrics_bar = st.progress(0, text="Loading campaign metrics…")
+
+for i, c in enumerate(campaigns):
+    metrics_bar.progress(
+        (i + 1) / len(campaigns),
+        text=f"Metrics {i + 1}/{len(campaigns)}: {c.get('name', c['id'])}",
+    )
+    try:
+        metrics = fetch_campaign_metrics(c["id"])
+    except Exception:
+        metrics = {"newContactsFirstTouch": 0, "newContactsLastTouch": 0}
+
+    name      = c.get("name", "")
+    # Prefer startDate, fall back to createdAt; both may be ISO strings or epoch ms
+    start_raw = c.get("startDate") or c.get("createdAt") or ""
+    try:
+        sort_date = pd.to_datetime(start_raw, unit="ms" if str(start_raw).isdigit() else None).date()
+    except Exception:
+        sort_date = date.min
+
+    campaign_rows.append({
+        "id":        c["id"],
+        "name":      name,
+        "type":      "Event" if name.startswith("EV-") else "Webinar",
+        "sort_date": sort_date,
+        "ft_count":  int(metrics.get("newContactsFirstTouch", 0)),
+        "lt_count":  int(metrics.get("newContactsLastTouch",  0)),
+    })
+
+metrics_bar.empty()
+
+# Apply current attribution model and filter out zero-registration campaigns
+for row in campaign_rows:
+    row["count"] = row["ft_count"] if attr_model == "First touch" else row["lt_count"]
+
+campaign_rows = [r for r in campaign_rows if r["count"] > 0]
+
+if not campaign_rows:
+    st.info(
+        f"No campaigns have registrations under {attr_model}. "
+        "Try switching the attribution model or check the HubSpot date range."
+    )
+    st.stop()
+
+# Sort descending by date for the table (most recent first)
+campaign_rows.sort(key=lambda r: r["sort_date"], reverse=True)
+
+
+# ── Fetch contact source breakdown (slow, 24 h cache) ─────────────────────────
+sources_bar = st.progress(0, text="Loading contact sources (cached 24 h)…")
+
+for i, row in enumerate(campaign_rows):
+    sources_bar.progress(
+        (i + 1) / len(campaign_rows),
+        text=f"Sources {i + 1}/{len(campaign_rows)}: {row['name']}",
+    )
+    try:
+        raw_contacts     = fetch_campaign_contacts_raw(row["id"], attr_hs_key)
+        row["sources"]   = _aggregate_sources(raw_contacts, target_domains)
+        row["n_contacts"] = len(raw_contacts)
+    except Exception:
+        row["sources"]    = {}
+        row["n_contacts"] = 0
+
+sources_bar.empty()
+
+
+# ── Metric cards ───────────────────────────────────────────────────────────────
+total_registrations = sum(r["count"] for r in campaign_rows)
+email_total         = sum(r["sources"].get("Email marketing", 0) for r in campaign_rows)
+email_pct           = email_total / total_registrations if total_registrations else 0
+n_campaigns         = len(campaign_rows)
+
+m1, m2, m3, m4 = st.columns(4)
+m1.metric("Net-new contacts",  f"{total_registrations:,}")
+m2.metric("Email-sourced",     f"{email_total:,}")
+m3.metric("Email share",       f"{email_pct:.1%}")
+m4.metric("Campaigns tracked", str(n_campaigns))
+
+if target_domains:
+    st.caption(
+        f"⚠️  Target-account filter active ({len(target_domains):,} domains). "
+        "Source channel counts reflect target-account contacts only. "
+        "Registration totals in the metric cards are unfiltered."
+    )
+
+st.divider()
+
+# ── Horizontal stacked bar chart ───────────────────────────────────────────────
+# Sort ascending by date so Plotly's bottom→top axis puts the newest campaign at the top.
+chart_rows = sorted(campaign_rows, key=lambda r: r["sort_date"])
+
+fig = go.Figure()
+for channel in CHANNEL_ORDER:
+    vals = [r["sources"].get(channel, 0) for r in chart_rows]
+    if sum(vals) == 0:
+        continue
+    fig.add_trace(go.Bar(
+        name=channel,
+        x=vals,
+        y=[r["name"] for r in chart_rows],
+        orientation="h",
+        marker_color=CHANNEL_COLORS[channel],
+        hovertemplate="%{y}<br>" + channel + ": %{x:,d}<extra></extra>",
+    ))
+
+fig.update_layout(
+    barmode="stack",
+    height=max(350, 52 * len(chart_rows) + 100),
+    margin=dict(l=20, r=40, t=10, b=40),
+    xaxis=dict(title="Net-new contacts", showgrid=True, gridcolor="#F0F0F0"),
+    yaxis=dict(title=None),
+    legend=dict(
+        orientation="h",
+        yanchor="bottom", y=1.02,
+        xanchor="left",   x=0,
+        font=dict(size=12, family="IBM Plex Sans"),
+    ),
+    plot_bgcolor="white",
+    paper_bgcolor="white",
+)
+
+st.plotly_chart(fig, use_container_width=True)
+
+
+# ── Per-campaign table ─────────────────────────────────────────────────────────
+st.divider()
+with st.expander("Per-campaign breakdown", expanded=True):
+    table_rows = []
+    for r in campaign_rows:  # already sorted most-recent first
+        src        = r["sources"]
+        src_total  = sum(src.values())
+        email_cnt  = src.get("Email marketing", 0)
+        table_rows.append({
+            "Campaign":      r["name"],
+            "Type":          r["type"],
+            "Date":          r["sort_date"].isoformat() if r["sort_date"] != date.min else "—",
+            "Registrations": r["count"],
+            "Email-sourced": email_cnt,
+            "Email %":       f"{email_cnt / src_total:.0%}" if src_total else "—",
+            **{ch: src.get(ch, 0) for ch in CHANNEL_ORDER},
+        })
+    st.dataframe(pd.DataFrame(table_rows), use_container_width=True, hide_index=True)
+
+
+# ── Footer ─────────────────────────────────────────────────────────────────────
+st.caption(
+    f"Attribution window: {METRICS_START} to {date.today().isoformat()}. "
+    "Source buckets from `hs_analytics_source` (HubSpot original source). "
+    "Campaign metrics cached 1 h; contact source lookup cached 24 h."
+)
+with st.expander("Methodology"):
+    st.markdown("""
+**Attribution model** controls which set of contacts is counted per campaign:
+- **First touch** — contacts for whom this campaign was the first known marketing touchpoint.
+- **Last touch** — contacts for whom this campaign was the most recent touchpoint before conversion.
+
+**Source bucketing** maps `hs_analytics_source` values as follows:
+
+| HubSpot value | Chart channel |
+|---|---|
+| `EMAIL_MARKETING` | Email marketing |
+| `ORGANIC_SEARCH` | Organic search |
+| `SOCIAL_MEDIA`, `PAID_SOCIAL` | Social media |
+| `OTHER_CAMPAIGNS`, `PAID_SEARCH` | Other campaigns |
+| `DIRECT_TRAFFIC` | Direct |
+| Everything else | Referrals / other |
+
+Campaigns with zero registrations in the selected attribution model are hidden.
+Invite-driven roadshows (Bristol, DC, FORMNEXT, SciTech, El Segundo) appear
+with low counts — this is expected.
+""")
