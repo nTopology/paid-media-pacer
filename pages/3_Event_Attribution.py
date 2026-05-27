@@ -362,6 +362,14 @@ metric_key = (
 
 
 # ── Load campaigns ─────────────────────────────────────────────────────────────
+if not _hs_token():
+    st.error(
+        "HubSpot API token is not set. "
+        "Go to Streamlit Cloud → your app → ⋮ → Settings → Secrets and add:\n\n"
+        "```\nhubspot_api_token = \"pat-na1-...\"\n```"
+    )
+    st.stop()
+
 with st.spinner("Fetching campaign list from HubSpot…"):
     try:
         all_campaigns = fetch_ev_wn_campaigns()
