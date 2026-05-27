@@ -211,66 +211,6 @@ def _bucket_source(src: str) -> str:
     return "Referrals / other"
 
 
-def _debug_contact_probe(campaign_guid: str) -> dict:
-    """
-    Uncached diagnostic: makes the actual HTTP calls and returns full response info.
-    Used only in the debug expander — never cached.
-    """
-    today_str = date.today().isoformat()
-    out: dict = {"campaign_guid": campaign_guid}
-
-    # Step 1: contacts endpoint
-    url1 = (
-        f"{HS_BASE}/marketing/v3/campaigns/{campaign_guid}"
-        "/reports/contacts/contactFirstTouch"
-    )
-    params1 = {"startDate": METRICS_START, "endDate": today_str, "limit": 10}
-    try:
-        r1 = requests.get(url1, headers=_hs_headers(), params=params1, timeout=30)
-        out["contacts_url"]    = r1.url
-        out["contacts_status"] = r1.status_code
-        out["contacts_body"]   = r1.text[:2000]
-        data1 = r1.json() if r1.ok else {}
-        ids = [
-            str(item.get("id") or item.get("contactId", ""))
-            for item in data1.get("results", [])
-            if item.get("id") or item.get("contactId")
-        ]
-        out["contact_ids_found"]  = len(ids)
-        out["contact_ids_sample"] = ids[:5]
-    except Exception as exc:
-        out["contacts_exception"] = str(exc)
-        ids = []
-
-    if not ids:
-        out["batch_read"] = "skipped — contacts endpoint returned 0 IDs"
-        return out
-
-    # Step 2: batch read
-    try:
-        r2 = requests.post(
-            f"{HS_BASE}/crm/v3/objects/contacts/batch/read",
-            headers=_hs_headers(),
-            json={
-                "inputs":     [{"id": cid} for cid in ids],
-                "properties": ["hs_analytics_source", "hs_latest_source"],
-            },
-            timeout=30,
-        )
-        out["batch_status"]        = r2.status_code
-        out["batch_body"]          = r2.text[:2000]
-        data2                      = r2.json() if r2.ok else {}
-        out["batch_results_count"] = len(data2.get("results", []))
-        out["sources_non_null"]    = sum(
-            1 for c in data2.get("results", [])
-            if (c.get("properties") or {}).get("hs_analytics_source")
-        )
-    except Exception as exc:
-        out["batch_exception"] = str(exc)
-
-    return out
-
-
 # ── Data fetchers ──────────────────────────────────────────────────────────────
 
 @st.cache_data(ttl=3600)
@@ -328,7 +268,7 @@ def fetch_contact_ids(campaign_guid: str, attr_type: str) -> list[str]:
         }
         if after:
             params["after"] = after
-        # Let HTTP errors propagate — caller catches and records them in id_errors.
+        # Let HTTP errors propagate — caller catches and records them.
         data = _hs_get(
             f"/marketing/v3/campaigns/{campaign_guid}/reports/contacts/{attr_type}",
             params,
@@ -516,9 +456,9 @@ campaign_rows.sort(key=lambda r: r["sort_date"], reverse=True)
 
 # ── Fetch contact IDs for every campaign (both models, 1 h cache) ──────────────
 # Fetch FT + LT for all campaigns upfront so switching the model toggle is instant.
-ft_ids:    dict[str, list[str]] = {}
-lt_ids:    dict[str, list[str]] = {}
-id_errors: dict[str, str]       = {}   # campaign_id → error string, if any
+ft_ids:     dict[str, list[str]] = {}
+lt_ids:     dict[str, list[str]] = {}
+first_error: str | None          = None
 
 id_bar = st.progress(0, text="Fetching contact IDs…")
 for i, row in enumerate(campaign_rows):
@@ -530,13 +470,14 @@ for i, row in enumerate(campaign_rows):
         ft_ids[row["id"]] = fetch_contact_ids(row["id"], "contactFirstTouch")
     except Exception as exc:
         ft_ids[row["id"]] = []
-        id_errors[row["id"]] = f"FT fetch failed: {exc}"
+        if first_error is None:
+            first_error = str(exc)
     try:
         lt_ids[row["id"]] = fetch_contact_ids(row["id"], "contactLastTouch")
     except Exception as exc:
         lt_ids[row["id"]] = []
-        prev = id_errors.get(row["id"], "")
-        id_errors[row["id"]] = (prev + " | " if prev else "") + f"LT fetch failed: {exc}"
+        if first_error is None:
+            first_error = str(exc)
 id_bar.empty()
 
 # Deduplicate across both models and bulk-read sources in one shot (24 h cache).
@@ -566,35 +507,6 @@ for row in campaign_rows:
 
 # Determine whether source data actually loaded before rendering cards or chart.
 sources_available = any(sum(r["sources"].values()) > 0 for r in campaign_rows)
-
-
-# ── Debug expander (always visible so failures are surfaced immediately) ────────
-ft_total = sum(len(v) for v in ft_ids.values())
-lt_total = sum(len(v) for v in lt_ids.values())
-with st.expander(
-    "Debug: contact source diagnostics"
-    + (" ✓" if sources_available else " ✗ — source data missing"),
-    expanded=not sources_available,
-):
-    st.write(f"**Campaigns in filter:** {len(campaign_rows)}")
-    st.write(f"**FT contact IDs returned by API:** {ft_total}")
-    st.write(f"**LT contact IDs returned by API:** {lt_total}")
-    st.write(f"**Unique IDs sent to batch read:** {len(all_ids)}")
-    st.write(f"**Source values resolved:** {len(sources_lookup)}")
-    if id_errors:
-        st.write("**Per-campaign fetch errors:**")
-        for cid, err in id_errors.items():
-            st.write(f"- `{cid}`: {err}")
-    if bulk_error:
-        st.write(f"**Batch read error:** `{bulk_error}`")
-    if campaign_rows:
-        first = campaign_rows[0]
-        st.write(
-            f"**Live probe for:** `{first['name']}` — GUID `{first['id']}`"
-        )
-        with st.spinner("Running probe…"):
-            probe = _debug_contact_probe(first["id"])
-        st.json(probe)
 
 
 # ── Metric cards ───────────────────────────────────────────────────────────────
@@ -662,9 +574,9 @@ if sources_available:
         ))
 else:
     # Source data failed — show error and grey registration totals as placeholder.
-    err_detail = bulk_error or (list(id_errors.values())[0] if id_errors else "0 contact IDs returned from the contacts endpoint")
+    err_detail = bulk_error or first_error or "0 contact IDs returned from the contacts endpoint"
     st.error(
-        f"Contact source breakdown unavailable — check the Debug expander above for the full API response. "
+        f"Contact source breakdown unavailable. "
         f"Error: {err_detail}"
     )
     fig.add_trace(go.Bar(
