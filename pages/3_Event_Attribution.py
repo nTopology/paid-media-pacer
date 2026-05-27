@@ -222,7 +222,7 @@ def _debug_contact_probe(campaign_guid: str) -> dict:
     # Step 1: contacts endpoint
     url1 = (
         f"{HS_BASE}/marketing/v3/campaigns/{campaign_guid}"
-        "/reports/contacts/NEW_CONTACTS_FIRST_TOUCH"
+        "/reports/contacts/contactFirstTouch"
     )
     params1 = {"startDate": METRICS_START, "endDate": today_str, "limit": 10}
     try:
@@ -314,7 +314,7 @@ def fetch_campaign_metrics(campaign_guid: str, start_date: str, end_date: str) -
 def fetch_contact_ids(campaign_guid: str, attr_type: str) -> list[str]:
     """
     GET /marketing/v3/campaigns/{guid}/reports/contacts/{attr_type}
-    attr_type must be NEW_CONTACTS_FIRST_TOUCH or NEW_CONTACTS_LAST_TOUCH.
+    attr_type must be contactFirstTouch or contactLastTouch.
     Returns list of contact ID strings. Cached 1 h.
     """
     today_str = date.today().isoformat()
@@ -527,12 +527,12 @@ for i, row in enumerate(campaign_rows):
         text=f"Contact IDs {i + 1}/{len(campaign_rows)}: {row['name']}",
     )
     try:
-        ft_ids[row["id"]] = fetch_contact_ids(row["id"], "NEW_CONTACTS_FIRST_TOUCH")
+        ft_ids[row["id"]] = fetch_contact_ids(row["id"], "contactFirstTouch")
     except Exception as exc:
         ft_ids[row["id"]] = []
         id_errors[row["id"]] = f"FT fetch failed: {exc}"
     try:
-        lt_ids[row["id"]] = fetch_contact_ids(row["id"], "NEW_CONTACTS_LAST_TOUCH")
+        lt_ids[row["id"]] = fetch_contact_ids(row["id"], "contactLastTouch")
     except Exception as exc:
         lt_ids[row["id"]] = []
         prev = id_errors.get(row["id"], "")
