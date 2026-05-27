@@ -823,9 +823,27 @@ ta_segment = st.radio(
 )
 
 with st.spinner("Loading target account domains (cached 24 h)…"):
-    domain_data = fetch_target_domains()
+    try:
+        domain_data = fetch_target_domains()
+    except requests.HTTPError as exc:
+        status = exc.response.status_code if exc.response is not None else "?"
+        body = exc.response.text[:400] if exc.response is not None else ""
+        st.error(
+            f"HubSpot company search returned **{status}**.\n\n"
+            f"**Details:** {body}\n\n"
+            "The Target Account section needs the **`crm.objects.companies.read`** scope "
+            "on your HubSpot private app token. Go to HubSpot → Settings → Integrations → "
+            "Private Apps → your app → Scopes → add `crm.objects.companies.read`, then "
+            "copy the new token into Streamlit secrets."
+        )
+        domain_data = None
+    except Exception as exc:
+        st.error(f"Could not fetch target domains: {exc}")
+        domain_data = None
 
-if ta_segment == "Aerospace":
+if domain_data is None:
+    ta_domains = ()
+elif ta_segment == "Aerospace":
     ta_domains = tuple(domain_data["aero"])
 elif ta_segment == "Turbomachinery":
     ta_domains = tuple(domain_data["turbo"])
@@ -871,13 +889,27 @@ else:
         _months.append((_y, _m))
 
     monthly_counts: list[dict] = []
+    _ta_error: str | None = None
     _month_bar = st.progress(0, text="Loading monthly target account contacts…")
     for _idx, (_y, _m) in enumerate(_months):
         _month_bar.progress(
             (_idx + 1) / len(_months),
             text=f"Month {_idx + 1}/{len(_months)}: {date(_y, _m, 1).strftime('%b %Y')}",
         )
-        _cnt = _count_month(ta_domains, _y, _m)
+        try:
+            _cnt = _count_month(ta_domains, _y, _m)
+        except requests.HTTPError as exc:
+            _cnt = 0
+            if _ta_error is None:
+                _s = exc.response.status_code if exc.response is not None else "?"
+                _ta_error = (
+                    f"Contact search returned **{_s}**. "
+                    "Add **`crm.objects.contacts.read`** scope to the HubSpot token."
+                )
+        except Exception as exc:
+            _cnt = 0
+            if _ta_error is None:
+                _ta_error = str(exc)
         monthly_counts.append({
             "year": _y, "month": _m,
             "label": date(_y, _m, 1).strftime("%b %Y"),
@@ -886,8 +918,15 @@ else:
         })
     _month_bar.empty()
 
-    with st.spinner("Loading current total…"):
-        ta_current_total = fetch_total_target_contacts(ta_domains)
+    if _ta_error:
+        st.error(_ta_error)
+
+    ta_current_total = 0
+    try:
+        with st.spinner("Loading current total…"):
+            ta_current_total = fetch_total_target_contacts(ta_domains)
+    except Exception:
+        pass
 
     # ── Metric cards ──────────────────────────────────────────────────────────
     ta_last_3 = sum(mc["count"] for mc in monthly_counts[-3:])
