@@ -186,27 +186,50 @@ def _bucket_source(src: str) -> str:
 
 # ── Data fetchers ──────────────────────────────────────────────────────────────
 
-@st.cache_data(ttl=3600)
+# ── Hardcoded campaign list ────────────────────────────────────────────────────
+# The /marketing/v3/campaigns endpoint returns campaigns but with empty name
+# fields under the current token scopes, so discovery is broken. Campaigns are
+# hardcoded here until the HubSpot token is updated with marketing.campaigns.read,
+# marketing-email, and marketing.campaigns.revenue.read scopes (path 1 fix).
+_CAMPAIGNS: list[dict] = [
+    # Events
+    {"id": "413533071778",  "name": "EV-2025-06-24-Computational Design Summit"},
+    {"id": "468051493965",  "name": "EV-2025-11-03-Roadshow Bristol"},
+    {"id": "470803569443",  "name": "EV-2025-10-21-Roadshow Augsburg"},
+    {"id": "474745764934",  "name": "EV-2025-11-18-FORMNEXT Roadshow Frankfurt"},
+    {"id": "468301910127",  "name": "EV-2025-11-19-Roadshow DC"},
+    {"id": "477072255005",  "name": "EV-2026-01-12-SciTech Roadshow Orlando"},
+    {"id": "477071806286",  "name": "EV-2026-02-03-MilAM Roadshow Tampa"},
+    {"id": "530710798660",  "name": "EV-2026-03-17-Roadshow El Segundo"},
+    {"id": "509150917711",  "name": "EV-2026-04-21-nTop Summit"},
+    {"id": "557271853459",  "name": "EV-2026-06-08-Roadshow AIAA Aviation Forum"},
+    {"id": "556806000640",  "name": "EV-2026-06-15-Roadshow ASME Turbo Expo"},
+    {"id": "556524205848",  "name": "EV-2026-06-16-Roadshow Reindustrialize Summit"},
+    # Webinars
+    {"id": "541866399340",  "name": "WN-2026-04-02-HEX Design with CFD Webinar"},
+    {"id": "529089029673",  "name": "WN-2026-02-26-Code-first Digital Engineering Webinar"},
+    {"id": "527601486890",  "name": "WN-2026-02-19-Heat Exchanger Design Webinar"},
+    {"id": "517505075119",  "name": "WN-2026-01-22-Accelerated Modeling Webinar"},
+    {"id": "488537414267",  "name": "WN-2025-11-18-AI Accelerated Aircraft Design Webinar"},
+    {"id": "479096377713",  "name": "WN-2025-11-05-Optimization Aircraft Webinar"},
+    {"id": "459152882516",  "name": "WN-2025-09-25-Aircraft Analysis Webinar"},
+    {"id": "451961574961",  "name": "WN-2025-08-26-Voxshell Webinar"},
+    {"id": "440091098904",  "name": "WN-2025-07-17-Conceptual Aircraft Design Webinar"},
+    {"id": "435973043345",  "name": "WN-2025-06-26-Simscale Webinar"},
+    {"id": "433444625724",  "name": "WN-2025-06-12-Fluids Webinar"},
+    {"id": "429490794881",  "name": "WN-2025-05-29-Introduction to nTop for Computational Design"},
+    {"id": "428039635098",  "name": "WN-2025-05-22-Luminary Webinar"},
+    {"id": "414154146468",  "name": "WN-2025-03-27-Introduction to nTop for Computational Design"},
+    {"id": "409396767235",  "name": "WN-2025-03-13-Intact Solutions for nTop Webinar"},
+]
+
+
 def fetch_all_campaigns() -> list[dict]:
-    """Paginate /marketing/v3/campaigns and return every campaign."""
-    campaigns: list[dict] = []
-    after: str | None = None
-    while True:
-        params: dict = {"limit": 100}
-        if after:
-            params["after"] = after
-        data = _hs_get("/marketing/v3/campaigns", params)
-        campaigns.extend(data.get("results", []))
-        after = ((data.get("paging") or {}).get("next") or {}).get("after")
-        if not after:
-            break
-    return campaigns
+    return _CAMPAIGNS
 
 
 def fetch_ev_wn_campaigns() -> list[dict]:
-    """Filter all campaigns to those starting with EV- or WN-."""
-    all_c = fetch_all_campaigns()
-    return [c for c in all_c if c.get("name", "").startswith(("EV-", "WN-"))]
+    return _CAMPAIGNS
 
 
 @st.cache_data(ttl=3600)
@@ -365,6 +388,13 @@ metric_key = (
 
 
 # ── Load campaigns ─────────────────────────────────────────────────────────────
+st.info(
+    "📋 Campaigns are hardcoded (27 total). "
+    "To auto-discover new campaigns, update the HubSpot token with "
+    "`marketing.campaigns.read`, `marketing-email`, and `marketing.campaigns.revenue.read` scopes.",
+    icon="ℹ️",
+)
+
 if not _hs_token():
     st.error(
         "HubSpot API token is not set. "
@@ -398,18 +428,7 @@ else:
     campaigns = list(all_campaigns)
 
 if not campaigns:
-    all_campaigns = fetch_all_campaigns()
-    if not all_campaigns:
-        st.error("No campaigns found in HubSpot at all. Check that the API token has the marketing.campaigns.read scope.")
-    else:
-        names = [c.get("name", "(unnamed)") for c in all_campaigns[:30]]
-        st.warning(
-            f"No campaigns found starting with 'EV-' or 'WN-'. "
-            f"Found {len(all_campaigns)} campaign(s) in HubSpot. "
-            f"First names seen:"
-        )
-        st.write(names)
-        st.caption("Tell me what prefix your event/webinar campaigns actually use and I'll update the filter.")
+    st.info("No campaigns match the current filter.")
     st.stop()
 
 
