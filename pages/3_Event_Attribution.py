@@ -111,6 +111,33 @@ section[data-testid="stSidebar"] div {{
     margin: 0;
     line-height: 1.4;
 }}
+.kpi-band {{
+    display: flex;
+    gap: 16px;
+    margin: 0 0 24px 0;
+}}
+.kpi-tile {{
+    flex: 1;
+    background: #f5f5f4;
+    border-radius: 8px;
+    padding: 1rem 1.25rem;
+    min-width: 0;
+}}
+.kpi-label {{
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.10em;
+    color: {_C["gray_mid"]};
+    margin-bottom: 6px;
+}}
+.kpi-value {{
+    font-family: 'Oswald', sans-serif;
+    font-weight: 700;
+    font-size: 28px;
+    color: {_C["black"]};
+    line-height: 1.1;
+}}
 </style>
 """
 
@@ -223,18 +250,16 @@ def fetch_campaign_metrics(campaign_guid: str, start_date: str, end_date: str) -
     )
 
 
-@st.cache_data(ttl=86400)
-def fetch_campaign_contacts_raw(campaign_guid: str, attribution_type: str) -> list[dict]:
+@st.cache_data(ttl=3600)
+def fetch_contact_ids(campaign_guid: str, attr_type: str) -> list[str]:
     """
-    GET /marketing/v3/campaigns/{campaignGuid}/reports/contacts/{contactType}
-    contactType: FIRST_TOUCH or LAST_TOUCH (not NEW_CONTACTS_* — that was wrong).
-    Batch-reads hs_analytics_source + email for source bucketing.
-    Cached 24 h — slow for campaigns with 1000+ contacts.
+    GET /marketing/v3/campaigns/{guid}/reports/contacts/{attr_type}
+    attr_type must be NEW_CONTACTS_FIRST_TOUCH or NEW_CONTACTS_LAST_TOUCH.
+    Returns list of contact ID strings. Cached 1 h.
     """
-    today_str   = date.today().isoformat()
-    contact_ids: list[str] = []
+    today_str = date.today().isoformat()
+    ids: list[str] = []
     after: str | None = None
-
     while True:
         params: dict = {
             "startDate": METRICS_START,
@@ -245,7 +270,7 @@ def fetch_campaign_contacts_raw(campaign_guid: str, attribution_type: str) -> li
             params["after"] = after
         try:
             data = _hs_get(
-                f"/marketing/v3/campaigns/{campaign_guid}/reports/contacts/{attribution_type}",
+                f"/marketing/v3/campaigns/{campaign_guid}/reports/contacts/{attr_type}",
                 params,
             )
         except requests.HTTPError:
@@ -254,49 +279,40 @@ def fetch_campaign_contacts_raw(campaign_guid: str, attribution_type: str) -> li
         for item in results:
             cid = item.get("id") or item.get("contactId")
             if cid:
-                contact_ids.append(str(cid))
+                ids.append(str(cid))
         after = ((data.get("paging") or {}).get("next") or {}).get("after")
         if not after or not results:
             break
+    return ids
 
+
+@st.cache_data(ttl=86400)
+def fetch_contact_sources_bulk(contact_ids: tuple[str, ...]) -> dict[str, str]:
+    """
+    POST /crm/v3/objects/contacts/batch/read for a deduplicated set of IDs.
+    Returns {contact_id: channel_bucket}. Accepts tuple so it's hashable. Cached 24 h.
+    """
     if not contact_ids:
-        return []
-
-    contacts: list[dict] = []
-    for i in range(0, len(contact_ids), 100):
-        chunk = contact_ids[i : i + 100]
+        return {}
+    result: dict[str, str] = {}
+    ids = list(contact_ids)
+    for i in range(0, len(ids), 100):
+        chunk = ids[i : i + 100]
         try:
             resp = _hs_post(
                 "/crm/v3/objects/contacts/batch/read",
                 {
                     "inputs":     [{"id": cid} for cid in chunk],
-                    "properties": ["hs_analytics_source", "hs_latest_source", "email"],
+                    "properties": ["hs_analytics_source", "hs_latest_source"],
                 },
             )
             for contact in resp.get("results", []):
-                props  = contact.get("properties") or {}
-                src    = props.get("hs_analytics_source") or ""
-                email  = props.get("email") or ""
-                domain = email.split("@")[-1].lower() if "@" in email else ""
-                contacts.append({"domain": domain, "bucket": _bucket_source(src)})
+                props = contact.get("properties") or {}
+                src   = props.get("hs_analytics_source") or ""
+                result[str(contact["id"])] = _bucket_source(src)
         except Exception:
             pass
-
-    return contacts
-
-
-def _aggregate_sources(
-    contacts: list[dict],
-    target_domains: frozenset[str] = frozenset(),
-) -> dict[str, int]:
-    """Sum contacts by channel bucket, optionally restricted to target domains."""
-    buckets: dict[str, int] = {}
-    for c in contacts:
-        if target_domains and c["domain"] not in target_domains:
-            continue
-        b = c["bucket"]
-        buckets[b] = buckets.get(b, 0) + 1
-    return buckets
+    return result
 
 
 # ── Page setup ─────────────────────────────────────────────────────────────────
@@ -320,9 +336,6 @@ st.markdown(
 )
 
 
-target_domains: frozenset[str] = frozenset()
-
-
 # ── Controls ───────────────────────────────────────────────────────────────────
 ctrl1, ctrl2 = st.columns(2)
 with ctrl1:
@@ -340,7 +353,6 @@ with ctrl2:
         index=0,
     )
 
-attr_hs_key = "FIRST_TOUCH" if attr_model == "First touch" else "LAST_TOUCH"
 metric_key  = "newContactsFirstTouch" if attr_model == "First touch" else "newContactsLastTouch"
 
 
@@ -446,25 +458,41 @@ if not campaign_rows:
 campaign_rows.sort(key=lambda r: r["sort_date"], reverse=True)
 
 
-# ── Fetch contact source breakdown (slow, 24 h cache) ─────────────────────────
-sources_bar = st.progress(0, text="Loading contact sources (cached 24 h)…")
+# ── Fetch contact IDs for every campaign (both models, 1 h cache) ──────────────
+# Fetch FT + LT for all campaigns upfront so switching the model toggle is instant.
+ft_ids: dict[str, list[str]] = {}   # campaign_id → list[contact_id]
+lt_ids: dict[str, list[str]] = {}
 
+id_bar = st.progress(0, text="Fetching contact IDs…")
 for i, row in enumerate(campaign_rows):
-    sources_bar.progress(
+    id_bar.progress(
         (i + 1) / len(campaign_rows),
-        text=f"Sources {i + 1}/{len(campaign_rows)}: {row['name']}",
+        text=f"Contact IDs {i + 1}/{len(campaign_rows)}: {row['name']}",
     )
-    try:
-        raw_contacts      = fetch_campaign_contacts_raw(row["id"], attr_hs_key)
-        row["sources"]    = _aggregate_sources(raw_contacts, target_domains)
-        row["n_contacts"] = len(raw_contacts)
-        row["src_error"]  = None
-    except Exception as _exc:
-        row["sources"]    = {}
-        row["n_contacts"] = 0
-        row["src_error"]  = str(_exc)
+    ft_ids[row["id"]] = fetch_contact_ids(row["id"], "NEW_CONTACTS_FIRST_TOUCH")
+    lt_ids[row["id"]] = fetch_contact_ids(row["id"], "NEW_CONTACTS_LAST_TOUCH")
+id_bar.empty()
 
-sources_bar.empty()
+# Deduplicate across both models and bulk-read sources in one shot (24 h cache).
+all_ids: tuple[str, ...] = tuple(sorted({
+    cid
+    for mapping in (ft_ids, lt_ids)
+    for ids in mapping.values()
+    for cid in ids
+}))
+with st.spinner(f"Loading sources for {len(all_ids):,} unique contacts (cached 24 h)…"):
+    sources_lookup: dict[str, str] = fetch_contact_sources_bulk(all_ids)
+
+# Aggregate per campaign using whichever ID list the selected model needs.
+for row in campaign_rows:
+    id_list = ft_ids.get(row["id"], []) if attr_model == "First touch" else lt_ids.get(row["id"], [])
+    src: dict[str, int] = {}
+    for cid in id_list:
+        bucket = sources_lookup.get(cid, "Referrals / other")
+        src[bucket] = src.get(bucket, 0) + 1
+    row["sources"]    = src
+    row["n_contacts"] = len(id_list)
+    row["src_error"]  = None
 
 
 # ── Metric cards ───────────────────────────────────────────────────────────────
@@ -473,11 +501,27 @@ email_total         = sum(r["sources"].get("Email marketing", 0) for r in campai
 email_pct           = email_total / total_registrations if total_registrations else 0
 n_campaigns         = len(campaign_rows)
 
-m1, m2, m3, m4 = st.columns(4)
-m1.metric("Net-new contacts",  f"{total_registrations:,}")
-m2.metric("Email-sourced",     f"{email_total:,}")
-m3.metric("Email share",       f"{email_pct:.1%}")
-m4.metric("Campaigns tracked", str(n_campaigns))
+st.markdown(
+    f'<div class="kpi-band">'
+    f'<div class="kpi-tile">'
+    f'<div class="kpi-label">Net-new contacts</div>'
+    f'<div class="kpi-value">{total_registrations:,}</div>'
+    f'</div>'
+    f'<div class="kpi-tile">'
+    f'<div class="kpi-label">Email-sourced</div>'
+    f'<div class="kpi-value">{email_total:,}</div>'
+    f'</div>'
+    f'<div class="kpi-tile">'
+    f'<div class="kpi-label">Email share</div>'
+    f'<div class="kpi-value">{email_pct:.1%}</div>'
+    f'</div>'
+    f'<div class="kpi-tile">'
+    f'<div class="kpi-label">Campaigns tracked</div>'
+    f'<div class="kpi-value">{n_campaigns}</div>'
+    f'</div>'
+    f'</div>',
+    unsafe_allow_html=True,
+)
 
 st.divider()
 
