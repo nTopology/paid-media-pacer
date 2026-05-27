@@ -333,49 +333,7 @@ st.markdown(
 )
 
 
-# ── Sidebar — target account filter (stretch goal) ────────────────────────────
 target_domains: frozenset[str] = frozenset()
-
-with st.sidebar:
-    st.header("Target account filter")
-    st.caption(
-        "Upload Aerospace_Target_List.csv or Turbo_Target_List.csv. "
-        "Contacts are matched by email domain to a domain/website column in the CSV."
-    )
-    uploaded_files = st.file_uploader(
-        "Upload CSV(s)",
-        type=["csv"],
-        accept_multiple_files=True,
-        label_visibility="collapsed",
-    )
-    if uploaded_files:
-        raw_domains: set[str] = set()
-        for uf in uploaded_files:
-            try:
-                tmp = pd.read_csv(uf)
-                for col in tmp.columns:
-                    if any(k in col.lower() for k in ("domain", "website", "url")):
-                        for val in tmp[col].dropna().astype(str):
-                            v = val.strip().lower()
-                            for prefix in ("https://", "http://", "www."):
-                                v = v.removeprefix(prefix)
-                            v = v.split("/")[0]
-                            if "." in v:
-                                raw_domains.add(v)
-            except Exception as exc:
-                st.warning(f"{uf.name}: {exc}")
-        if raw_domains:
-            target_domains = frozenset(raw_domains)
-            st.success(f"{len(target_domains):,} target domains loaded.")
-        else:
-            st.warning("No domain/website column found in uploaded CSV(s).")
-
-    if target_domains:
-        st.divider()
-        with st.expander("Preview domains"):
-            st.write(sorted(target_domains)[:50])
-            if len(target_domains) > 50:
-                st.caption(f"… and {len(target_domains) - 50} more")
 
 
 # ── Controls ───────────────────────────────────────────────────────────────────
@@ -407,6 +365,16 @@ metric_key = (
 with st.spinner("Fetching campaign list from HubSpot…"):
     try:
         all_campaigns = fetch_ev_wn_campaigns()
+    except requests.HTTPError as exc:
+        status = exc.response.status_code if exc.response is not None else "?"
+        body   = exc.response.text[:400] if exc.response is not None else ""
+        st.error(
+            f"HubSpot API returned {status}.\n\n"
+            f"**Details:** {body}\n\n"
+            "If this says 'MISSING_SCOPES', the Service Key is missing `marketing.campaigns.read`. "
+            "If it says 'INVALID_AUTHENTICATION', the token in Streamlit secrets is wrong."
+        )
+        st.stop()
     except Exception as exc:
         st.error(f"Could not fetch campaigns: {exc}")
         st.stop()
@@ -506,13 +474,6 @@ m1.metric("Net-new contacts",  f"{total_registrations:,}")
 m2.metric("Email-sourced",     f"{email_total:,}")
 m3.metric("Email share",       f"{email_pct:.1%}")
 m4.metric("Campaigns tracked", str(n_campaigns))
-
-if target_domains:
-    st.caption(
-        f"⚠️  Target-account filter active ({len(target_domains):,} domains). "
-        "Source channel counts reflect target-account contacts only. "
-        "Registration totals in the metric cards are unfiltered."
-    )
 
 st.divider()
 
