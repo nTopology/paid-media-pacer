@@ -186,74 +186,50 @@ def _bucket_source(src: str) -> str:
 
 # ── Data fetchers ──────────────────────────────────────────────────────────────
 
-# ── Hardcoded campaign list ────────────────────────────────────────────────────
-# The /marketing/v3/campaigns endpoint returns campaigns but with empty name
-# fields under the current token scopes, so discovery is broken. Campaigns are
-# hardcoded here until the HubSpot token is updated with marketing.campaigns.read,
-# marketing-email, and marketing.campaigns.revenue.read scopes (path 1 fix).
-_CAMPAIGNS: list[dict] = [
-    # Events
-    {"id": "413533071778",  "name": "EV-2025-06-24-Computational Design Summit"},
-    {"id": "468051493965",  "name": "EV-2025-11-03-Roadshow Bristol"},
-    {"id": "470803569443",  "name": "EV-2025-10-21-Roadshow Augsburg"},
-    {"id": "474745764934",  "name": "EV-2025-11-18-FORMNEXT Roadshow Frankfurt"},
-    {"id": "468301910127",  "name": "EV-2025-11-19-Roadshow DC"},
-    {"id": "477072255005",  "name": "EV-2026-01-12-SciTech Roadshow Orlando"},
-    {"id": "477071806286",  "name": "EV-2026-02-03-MilAM Roadshow Tampa"},
-    {"id": "530710798660",  "name": "EV-2026-03-17-Roadshow El Segundo"},
-    {"id": "509150917711",  "name": "EV-2026-04-21-nTop Summit"},
-    {"id": "557271853459",  "name": "EV-2026-06-08-Roadshow AIAA Aviation Forum"},
-    {"id": "556806000640",  "name": "EV-2026-06-15-Roadshow ASME Turbo Expo"},
-    {"id": "556524205848",  "name": "EV-2026-06-16-Roadshow Reindustrialize Summit"},
-    # Webinars
-    {"id": "541866399340",  "name": "WN-2026-04-02-HEX Design with CFD Webinar"},
-    {"id": "529089029673",  "name": "WN-2026-02-26-Code-first Digital Engineering Webinar"},
-    {"id": "527601486890",  "name": "WN-2026-02-19-Heat Exchanger Design Webinar"},
-    {"id": "517505075119",  "name": "WN-2026-01-22-Accelerated Modeling Webinar"},
-    {"id": "488537414267",  "name": "WN-2025-11-18-AI Accelerated Aircraft Design Webinar"},
-    {"id": "479096377713",  "name": "WN-2025-11-05-Optimization Aircraft Webinar"},
-    {"id": "459152882516",  "name": "WN-2025-09-25-Aircraft Analysis Webinar"},
-    {"id": "451961574961",  "name": "WN-2025-08-26-Voxshell Webinar"},
-    {"id": "440091098904",  "name": "WN-2025-07-17-Conceptual Aircraft Design Webinar"},
-    {"id": "435973043345",  "name": "WN-2025-06-26-Simscale Webinar"},
-    {"id": "433444625724",  "name": "WN-2025-06-12-Fluids Webinar"},
-    {"id": "429490794881",  "name": "WN-2025-05-29-Introduction to nTop for Computational Design"},
-    {"id": "428039635098",  "name": "WN-2025-05-22-Luminary Webinar"},
-    {"id": "414154146468",  "name": "WN-2025-03-27-Introduction to nTop for Computational Design"},
-    {"id": "409396767235",  "name": "WN-2025-03-13-Intact Solutions for nTop Webinar"},
-]
-
-
-def fetch_all_campaigns() -> list[dict]:
-    return _CAMPAIGNS
-
-
+@st.cache_data(ttl=3600)
 def fetch_ev_wn_campaigns() -> list[dict]:
-    return _CAMPAIGNS
+    """
+    Paginate /marketing/v3/campaigns with properties=hs_name so names are populated.
+    The `id` field on each result is the campaign GUID used in all subsequent calls.
+    Returns list of {"id": guid, "name": str} filtered to EV- and WN- prefixes.
+    """
+    campaigns: list[dict] = []
+    after: str | None = None
+    while True:
+        params: dict = {"limit": 100, "properties": "hs_name"}
+        if after:
+            params["after"] = after
+        data = _hs_get("/marketing/v3/campaigns", params)
+        for c in data.get("results", []):
+            name = (c.get("properties") or {}).get("hs_name", "")
+            if name.startswith("EV-") or name.startswith("WN-"):
+                campaigns.append({"id": c["id"], "name": name})
+        after = ((data.get("paging") or {}).get("next") or {}).get("after")
+        if not after:
+            break
+    return campaigns
 
 
 @st.cache_data(ttl=3600)
-def fetch_campaign_metrics(campaign_id: str, start_date: str, end_date: str) -> dict:
+def fetch_campaign_metrics(campaign_guid: str, start_date: str, end_date: str) -> dict:
     """
-    Return raw metrics dict from HubSpot for this campaign.
-    start_date and end_date are explicit args so they're part of the cache key
-    (avoids replaying a stale zero result from a previous date range).
+    GET /marketing/v3/campaigns/{campaignGuid}/reports/metrics
+    Uses GUID (the `id` from the list endpoint), not the numeric CRM object ID.
+    start_date/end_date are cache-key args to avoid replaying stale zeros.
     """
-    data = _hs_get(
-        f"/marketing/v3/campaigns/{campaign_id}/reports/metrics",
+    return _hs_get(
+        f"/marketing/v3/campaigns/{campaign_guid}/reports/metrics",
         {"startDate": start_date, "endDate": end_date},
     )
-    return data  # return raw so callers can inspect the full shape
 
 
 @st.cache_data(ttl=86400)
-def fetch_campaign_contacts_raw(campaign_id: str, attribution_type: str) -> list[dict]:
+def fetch_campaign_contacts_raw(campaign_guid: str, attribution_type: str) -> list[dict]:
     """
-    Fetch every contact attributed to this campaign via the given attribution type,
-    then batch-read their hs_analytics_source and email.
-
-    Returns list of {"domain": str, "bucket": str}.
-    Cached 24 h — potentially slow for campaigns with 1000+ contacts.
+    GET /marketing/v3/campaigns/{campaignGuid}/reports/contacts/{contactType}
+    contactType: FIRST_TOUCH or LAST_TOUCH (not NEW_CONTACTS_* — that was wrong).
+    Batch-reads hs_analytics_source + email for source bucketing.
+    Cached 24 h — slow for campaigns with 1000+ contacts.
     """
     today_str   = date.today().isoformat()
     contact_ids: list[str] = []
@@ -269,7 +245,7 @@ def fetch_campaign_contacts_raw(campaign_id: str, attribution_type: str) -> list
             params["after"] = after
         try:
             data = _hs_get(
-                f"/marketing/v3/campaigns/{campaign_id}/reports/contacts/{attribution_type}",
+                f"/marketing/v3/campaigns/{campaign_guid}/reports/contacts/{attribution_type}",
                 params,
             )
         except requests.HTTPError:
@@ -364,22 +340,11 @@ with ctrl2:
         index=0,
     )
 
-attr_hs_key = (
-    "NEW_CONTACTS_FIRST_TOUCH" if attr_model == "First touch" else "NEW_CONTACTS_LAST_TOUCH"
-)
-metric_key = (
-    "newContactsFirstTouch" if attr_model == "First touch" else "newContactsLastTouch"
-)
+attr_hs_key = "FIRST_TOUCH" if attr_model == "First touch" else "LAST_TOUCH"
+metric_key  = "newContactsFirstTouch" if attr_model == "First touch" else "newContactsLastTouch"
 
 
 # ── Load campaigns ─────────────────────────────────────────────────────────────
-st.info(
-    "📋 Campaigns are hardcoded (27 total). "
-    "To auto-discover new campaigns, update the HubSpot token with "
-    "`marketing.campaigns.read`, `marketing-email`, and `marketing.campaigns.revenue.read` scopes.",
-    icon="ℹ️",
-)
-
 if not _hs_token():
     st.error(
         "HubSpot API token is not set. "
@@ -429,9 +394,9 @@ for i, c in enumerate(campaigns):
     )
     try:
         raw = fetch_campaign_metrics(c["id"], METRICS_START, today_str)
-        # HubSpot returns {"metrics": {"newContactsFirstTouch": N, ...}}
-        m = raw.get("metrics") or {}
-        if isinstance(m, list):  # guard against unexpected list shape
+        # Response is either {"metrics": {...}} (nested) or the flat dict itself
+        m = raw.get("metrics") if isinstance(raw.get("metrics"), dict) else raw
+        if isinstance(m, list):
             m = {item.get("metric") or item.get("name"): item.get("value", 0) for item in m}
         ft = int(m.get("newContactsFirstTouch", 0) or 0)
         lt = int(m.get("newContactsLastTouch",  0) or 0)
