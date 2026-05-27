@@ -358,6 +358,7 @@ def fetch_target_domains() -> dict:
     """
     aero: set[str] = set()
     turbo: set[str] = set()
+    company_counts: dict[str, int] = {}
 
     for prop, bucket in [
         ("aircraft_concept_target_type", aero),
@@ -375,6 +376,8 @@ def fetch_target_domains() -> dict:
             if after:
                 payload["after"] = after
             data = _hs_post("/crm/v3/objects/companies/search", payload)
+            if prop not in company_counts:
+                company_counts[prop] = data.get("total", 0)
             for co in data.get("results", []):
                 d = (co.get("properties") or {}).get("domain", "")
                 if d:
@@ -389,6 +392,7 @@ def fetch_target_domains() -> dict:
     # Salesforce domains from BigQuery (secondary — for sync-diff logging)
     sf_all: set[str] = set()
     sf_error: str | None = None
+    sf_cols: list[str] = []
     client = _get_bq_client() if _HAS_BQ else None
     if client is not None:
         try:
@@ -400,9 +404,9 @@ def fetch_target_domains() -> dict:
                 "OR LOWER(column_name) LIKE '%aircraft%target%' "
                 "OR LOWER(column_name) LIKE '%turbomachinery%target%')"
             ).to_dataframe(create_bqstorage_client=False)
-            target_cols = col_df["column_name"].tolist()
-            if target_cols:
-                where = " OR ".join(f"`{c}` IS NOT NULL" for c in target_cols)
+            sf_cols = col_df["column_name"].tolist()
+            if sf_cols:
+                where = " OR ".join(f"`{c}` IS NOT NULL" for c in sf_cols)
                 df = client.query(
                     f"SELECT DISTINCT website "
                     f"FROM `bi-ntop.salesforce.account` "
@@ -424,42 +428,50 @@ def fetch_target_domains() -> dict:
         "hs_only": sorted(hs_all - sf_all) if sf_all else [],
         "sf_only": sorted(sf_all - hs_all) if sf_all else [],
         "sf_error": sf_error,
+        "company_counts": company_counts,
+        "aero_domain_count": len(aero),
+        "turbo_domain_count": len(turbo),
+        "overlap_domains": sorted(aero & turbo),
+        "sf_cols": sf_cols,
     }
 
 
 def _count_contacts_for_domains(
     domains: tuple[str, ...],
-    start_ms: str | None = None,
-    end_ms: str | None = None,
+    start_dt: str | None = None,
+    end_dt: str | None = None,
 ) -> int:
     """
     Count marketing contacts whose hs_email_domain is in the domain set.
-    Chunks domains ≤100 per IN filter; batches ≤5 filter groups per API call.
+    Chunks domains ≤100 per IN filter; batches filter groups per API call
+    staying within HubSpot's 18-total-filter and 5-group limits.
+    Date values must be ISO 8601 strings (e.g. "2026-04-01T00:00:00Z").
     """
     if not domains:
         return 0
     domain_list = list(domains)
     chunks = [domain_list[i : i + 100] for i in range(0, len(domain_list), 100)]
 
+    filters_per_group = 2 + (1 if start_dt else 0) + (1 if end_dt else 0)
+    max_groups = min(5, 18 // filters_per_group)
+
     total = 0
-    for batch_start in range(0, len(chunks), 5):
-        batch = chunks[batch_start : batch_start + 5]
+    for batch_start in range(0, len(chunks), max_groups):
+        batch = chunks[batch_start : batch_start + max_groups]
         filter_groups: list[dict] = []
         for chunk in batch:
             filters: list[dict] = [
                 {"propertyName": "hs_marketable_status", "operator": "EQ", "value": "true"},
                 {"propertyName": "hs_email_domain", "operator": "IN", "values": chunk},
             ]
-            if start_ms is not None:
-                filters.append({"propertyName": "createdate", "operator": "GTE", "value": start_ms})
-            if end_ms is not None:
-                filters.append({"propertyName": "createdate", "operator": "LT", "value": end_ms})
+            if start_dt is not None:
+                filters.append({"propertyName": "createdate", "operator": "GTE", "value": start_dt})
+            if end_dt is not None:
+                filters.append({"propertyName": "createdate", "operator": "LT", "value": end_dt})
             filter_groups.append({"filters": filters})
 
-        data = _hs_post("/crm/v3/objects/contacts/search", {
-            "filterGroups": filter_groups,
-            "limit": 1,
-        })
+        payload = {"filterGroups": filter_groups, "limit": 1}
+        data = _hs_post("/crm/v3/objects/contacts/search", payload)
         total += data.get("total", 0)
     return total
 
@@ -470,8 +482,8 @@ def _count_month(domains: tuple[str, ...], year: int, month: int) -> int:
     end = datetime(year + (1 if month == 12 else 0), (month % 12) + 1, 1, tzinfo=timezone.utc)
     return _count_contacts_for_domains(
         domains,
-        str(int(start.timestamp() * 1000)),
-        str(int(end.timestamp() * 1000)),
+        start.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        end.strftime("%Y-%m-%dT%H:%M:%SZ"),
     )
 
 
@@ -850,6 +862,43 @@ elif ta_segment == "Turbomachinery":
 else:
     ta_domains = tuple(domain_data["all"])
 
+if domain_data is not None:
+    with st.expander("Debug: domain resolution"):
+        cc = domain_data.get("company_counts", {})
+        st.markdown("**HubSpot company properties queried:**")
+        for prop_name in ["aircraft_concept_target_type", "turbomachinery_target_type"]:
+            co_total = cc.get(prop_name, "?")
+            if prop_name == "aircraft_concept_target_type":
+                dom_cnt = domain_data.get("aero_domain_count", "?")
+            else:
+                dom_cnt = domain_data.get("turbo_domain_count", "?")
+            st.markdown(
+                f"- `{prop_name}`: **{co_total}** companies → "
+                f"**{dom_cnt}** unique domains (after cleaning)"
+            )
+        overlap = domain_data.get("overlap_domains", [])
+        st.markdown(f"- Aero ∩ Turbo overlap: **{len(overlap)}** domains")
+        if overlap:
+            st.caption(", ".join(overlap[:30]) + ("…" if len(overlap) > 30 else ""))
+
+        st.markdown("**Source comparison:**")
+        st.markdown(
+            f"| Source | Domains |\n|---|---:|\n"
+            f"| HubSpot (union of both properties) | {domain_data['hs_count']} |\n"
+            f"| Salesforce via BQ (cols: {', '.join(domain_data.get('sf_cols', [])) or 'n/a'}) "
+            f"| {domain_data['sf_count']} |\n"
+            f"| Combined (deduplicated) | {len(domain_data['all'])} |"
+        )
+        hs_only = domain_data.get("hs_only", [])
+        sf_only = domain_data.get("sf_only", [])
+        if hs_only:
+            st.markdown(f"**HubSpot-only** ({len(hs_only)}): " + ", ".join(hs_only[:40]) + ("…" if len(hs_only) > 40 else ""))
+        if sf_only:
+            st.markdown(f"**Salesforce-only** ({len(sf_only)}): " + ", ".join(sf_only[:40]) + ("…" if len(sf_only) > 40 else ""))
+        if domain_data.get("sf_error"):
+            st.warning(f"Salesforce: {domain_data['sf_error']}")
+        st.markdown(f"**Selected segment ({ta_segment}):** {len(ta_domains)} domains → contact search uses these")
+
 if not ta_domains:
     st.warning("No target account domains found for this segment.")
 else:
@@ -902,9 +951,24 @@ else:
             _cnt = 0
             if _ta_error is None:
                 _s = exc.response.status_code if exc.response is not None else "?"
+                _body = ""
+                if exc.response is not None:
+                    try:
+                        _body = exc.response.text[:500]
+                    except Exception:
+                        pass
+                _start = datetime(_y, _m, 1, tzinfo=timezone.utc)
+                _end_y = _y + (1 if _m == 12 else 0)
+                _end_m = (_m % 12) + 1
+                _n_chunks = (len(ta_domains) + 99) // 100
                 _ta_error = (
-                    f"Contact search returned **{_s}**. "
-                    "Add **`crm.objects.contacts.read`** scope to the HubSpot token."
+                    f"Monthly contact search returned **{_s}** for "
+                    f"{date(_y, _m, 1).strftime('%b %Y')}.\n\n"
+                    f"**Request:** `createdate GTE {_start.strftime('%Y-%m-%dT%H:%M:%SZ')}"
+                    f"  LT {datetime(_end_y, _end_m, 1, tzinfo=timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')}`"
+                    f" — {len(ta_domains)} domains, {_n_chunks} chunks, "
+                    f"4 filters/group, batched ≤4 groups/call\n\n"
+                    f"**Response:**\n```\n{_body}\n```"
                 )
         except Exception as exc:
             _cnt = 0
