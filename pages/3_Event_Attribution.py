@@ -187,8 +187,8 @@ def _bucket_source(src: str) -> str:
 # ── Data fetchers ──────────────────────────────────────────────────────────────
 
 @st.cache_data(ttl=3600)
-def fetch_ev_wn_campaigns() -> list[dict]:
-    """Paginate /marketing/v3/campaigns and return only EV- and WN- campaigns."""
+def fetch_all_campaigns() -> list[dict]:
+    """Paginate /marketing/v3/campaigns and return every campaign."""
     campaigns: list[dict] = []
     after: str | None = None
     while True:
@@ -196,14 +196,17 @@ def fetch_ev_wn_campaigns() -> list[dict]:
         if after:
             params["after"] = after
         data = _hs_get("/marketing/v3/campaigns", params)
-        for c in data.get("results", []):
-            name = c.get("name", "")
-            if name.startswith("EV-") or name.startswith("WN-"):
-                campaigns.append(c)
+        campaigns.extend(data.get("results", []))
         after = ((data.get("paging") or {}).get("next") or {}).get("after")
         if not after:
             break
     return campaigns
+
+
+def fetch_ev_wn_campaigns() -> list[dict]:
+    """Filter all campaigns to those starting with EV- or WN-."""
+    all_c = fetch_all_campaigns()
+    return [c for c in all_c if c.get("name", "").startswith(("EV-", "WN-"))]
 
 
 @st.cache_data(ttl=3600)
@@ -395,10 +398,18 @@ else:
     campaigns = list(all_campaigns)
 
 if not campaigns:
-    st.info(
-        "No campaigns found. Check that HubSpot campaign names start with EV- or WN- "
-        "and that the API token has the marketing read scopes."
-    )
+    all_campaigns = fetch_all_campaigns()
+    if not all_campaigns:
+        st.error("No campaigns found in HubSpot at all. Check that the API token has the marketing.campaigns.read scope.")
+    else:
+        names = [c.get("name", "(unnamed)") for c in all_campaigns[:30]]
+        st.warning(
+            f"No campaigns found starting with 'EV-' or 'WN-'. "
+            f"Found {len(all_campaigns)} campaign(s) in HubSpot. "
+            f"First names seen:"
+        )
+        st.write(names)
+        st.caption("Tell me what prefix your event/webinar campaigns actually use and I'll update the filter.")
     st.stop()
 
 
