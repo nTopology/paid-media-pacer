@@ -443,8 +443,8 @@ for i, c in enumerate(campaigns):
     )
     try:
         metrics = fetch_campaign_metrics(c["id"])
-    except Exception:
-        metrics = {"newContactsFirstTouch": 0, "newContactsLastTouch": 0}
+    except Exception as _exc:
+        metrics = {"newContactsFirstTouch": 0, "newContactsLastTouch": 0, "_error": str(_exc)}
 
     name      = c.get("name", "")
     # Prefer startDate, fall back to createdAt; both may be ISO strings or epoch ms
@@ -469,13 +469,18 @@ metrics_bar.empty()
 for row in campaign_rows:
     row["count"] = row["ft_count"] if attr_model == "First touch" else row["lt_count"]
 
+campaign_rows_all = campaign_rows  # keep unfiltered copy for diagnostics
 campaign_rows = [r for r in campaign_rows if r["count"] > 0]
 
 if not campaign_rows:
-    st.info(
-        f"No campaigns have registrations under {attr_model}. "
-        "Try switching the attribution model or check the HubSpot date range."
-    )
+    errors = [r for r in campaign_rows_all if r.get("_error")]
+    sample = next((r for r in campaign_rows_all if r.get("_error")), None)
+    if sample:
+        st.error(f"Metrics endpoint error (first campaign): {sample['_error']}")
+    else:
+        totals = [(r["name"], r["ft_count"], r["lt_count"]) for r in campaign_rows_all[:5]]
+        st.warning("All campaigns returned 0 registrations. Sample counts:")
+        st.write(totals)
     st.stop()
 
 # Sort descending by date for the table (most recent first)
