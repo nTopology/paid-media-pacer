@@ -400,8 +400,7 @@ def fetch_target_domains() -> dict:
                 "SELECT column_name "
                 "FROM `bi-ntop.salesforce.INFORMATION_SCHEMA.COLUMNS` "
                 "WHERE table_name = 'account' AND ("
-                "LOWER(column_name) LIKE '%target_type%' "
-                "OR LOWER(column_name) LIKE '%aircraft%target%' "
+                "LOWER(column_name) LIKE '%aircraft%target%' "
                 "OR LOWER(column_name) LIKE '%turbomachinery%target%')"
             ).to_dataframe(create_bqstorage_client=False)
             sf_cols = col_df["column_name"].tolist()
@@ -1039,24 +1038,52 @@ else:
     )
     st.plotly_chart(fig_cum, use_container_width=True)
 
-    # ── Monthly bar chart (log scale) ─────────────────────────────────────────
-    _bar_colors = ["#7F77DD" if mc["count"] > 100 else "#1D9E75" for mc in monthly_counts]
+    # ── Monthly bar chart ───────────────────────────────────────────────────
+    _first_nonzero = next(
+        (i for i, mc in enumerate(monthly_counts) if mc["count"] > 0), 0,
+    )
+    _vis_months = monthly_counts[max(0, _first_nonzero - 1):]
+    _vis_dates = [mc["date"] for mc in _vis_months]
+    _vis_counts = [mc["count"] for mc in _vis_months]
+
+    _sorted_counts = sorted((c for c in _vis_counts if c > 0), reverse=True)
+    _second_max = _sorted_counts[1] if len(_sorted_counts) > 1 else (_sorted_counts[0] if _sorted_counts else 100)
+    _y_cap = max(200, _second_max * 2.5)
+    _clipped = [min(c, _y_cap) for c in _vis_counts]
+    _vis_colors = ["#7F77DD" if c > _y_cap * 0.95 else "#1D9E75" for c in _vis_counts]
+    _vis_labels = [
+        f"{c:,d}" if c > 0 else ""
+        for c in _vis_counts
+    ]
 
     fig_bar_ta = go.Figure()
     fig_bar_ta.add_trace(go.Bar(
-        x=_x_dates,
-        y=[mc["count"] for mc in monthly_counts],
-        marker_color=_bar_colors,
-        hovertemplate="%{x|%b %Y}<br>Added: %{y:,d}<extra></extra>",
+        x=_vis_dates,
+        y=_clipped,
+        marker_color=_vis_colors,
+        text=_vis_labels,
+        textposition="outside",
+        textfont=dict(size=11),
+        customdata=_vis_counts,
+        hovertemplate="%{x|%b %Y}<br>Added: %{customdata:,d}<extra></extra>",
     ))
+    for _d, _c in zip(_vis_dates, _vis_counts):
+        if _c > _y_cap:
+            fig_bar_ta.add_annotation(
+                x=_d, y=_y_cap * 0.92,
+                text=f"<b>{_c:,d}</b>",
+                showarrow=False,
+                font=dict(size=13, color="white"),
+            )
     _add_target_annotations(fig_bar_ta)
     fig_bar_ta.update_layout(
-        height=350,
+        height=380,
         margin=dict(l=20, r=20, t=60, b=40),
         xaxis=dict(title=None, dtick="M3", tickformat="%b %Y"),
         yaxis=dict(
-            title="Net-new contacts (log scale)", type="log",
+            title="Net-new contacts added",
             showgrid=True, gridcolor="#F0F0F0",
+            range=[0, _y_cap * 1.15],
         ),
         plot_bgcolor="white", paper_bgcolor="white",
     )
