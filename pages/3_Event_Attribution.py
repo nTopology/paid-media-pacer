@@ -455,12 +455,14 @@ for i, row in enumerate(campaign_rows):
         text=f"Sources {i + 1}/{len(campaign_rows)}: {row['name']}",
     )
     try:
-        raw_contacts     = fetch_campaign_contacts_raw(row["id"], attr_hs_key)
-        row["sources"]   = _aggregate_sources(raw_contacts, target_domains)
+        raw_contacts      = fetch_campaign_contacts_raw(row["id"], attr_hs_key)
+        row["sources"]    = _aggregate_sources(raw_contacts, target_domains)
         row["n_contacts"] = len(raw_contacts)
-    except Exception:
+        row["src_error"]  = None
+    except Exception as _exc:
         row["sources"]    = {}
         row["n_contacts"] = 0
+        row["src_error"]  = str(_exc)
 
 sources_bar.empty()
 
@@ -483,19 +485,38 @@ st.divider()
 # Sort ascending by date so Plotly's bottom→top axis puts the newest campaign at the top.
 chart_rows = sorted(campaign_rows, key=lambda r: r["sort_date"])
 
+# If all source lookups returned nothing, fall back to showing registration totals.
+sources_available = any(sum(r["sources"].values()) > 0 for r in chart_rows)
+
 fig = go.Figure()
-for channel in CHANNEL_ORDER:
-    vals = [r["sources"].get(channel, 0) for r in chart_rows]
-    if sum(vals) == 0:
-        continue
+if sources_available:
+    for channel in CHANNEL_ORDER:
+        vals = [r["sources"].get(channel, 0) for r in chart_rows]
+        if sum(vals) == 0:
+            continue
+        fig.add_trace(go.Bar(
+            name=channel,
+            x=vals,
+            y=[r["name"] for r in chart_rows],
+            orientation="h",
+            marker_color=CHANNEL_COLORS[channel],
+            hovertemplate="%{y}<br>" + channel + ": %{x:,d}<extra></extra>",
+        ))
+else:
+    # Fallback: show raw registration counts while source data is unavailable.
     fig.add_trace(go.Bar(
-        name=channel,
-        x=vals,
+        name="Registrations (source breakdown pending)",
+        x=[r["count"] for r in chart_rows],
         y=[r["name"] for r in chart_rows],
         orientation="h",
-        marker_color=CHANNEL_COLORS[channel],
-        hovertemplate="%{y}<br>" + channel + ": %{x:,d}<extra></extra>",
+        marker_color=_C["gray_mid"],
+        hovertemplate="%{y}<br>Registrations: %{x:,d}<extra></extra>",
     ))
+    first_err = next((r["src_error"] for r in chart_rows if r.get("src_error")), None)
+    if first_err:
+        st.warning(f"Contact source lookup failed — showing registration totals only. Error: {first_err}")
+    else:
+        st.info("Contact source data not yet loaded — showing registration totals. Source breakdown will appear once contacts are fetched.")
 
 fig.update_layout(
     barmode="stack",
@@ -525,12 +546,13 @@ with st.expander("Per-campaign breakdown", expanded=True):
         src_total  = sum(src.values())
         email_cnt  = src.get("Email marketing", 0)
         table_rows.append({
-            "Campaign":      r["name"],
-            "Type":          r["type"],
-            "Date":          r["sort_date"].isoformat() if r["sort_date"] != date.min else "—",
-            "Registrations": r["count"],
-            "Email-sourced": email_cnt,
-            "Email %":       f"{email_cnt / src_total:.0%}" if src_total else "—",
+            "Campaign":        r["name"],
+            "Type":            r["type"],
+            "Date":            r["sort_date"].isoformat() if r["sort_date"] != date.min else "—",
+            "Registrations":   r["count"],
+            "Contacts fetched": r.get("n_contacts", 0),
+            "Email-sourced":   email_cnt,
+            "Email %":         f"{email_cnt / src_total:.0%}" if src_total else "—",
             **{ch: src.get(ch, 0) for ch in CHANNEL_ORDER},
         })
     st.dataframe(pd.DataFrame(table_rows), use_container_width=True, hide_index=True)
