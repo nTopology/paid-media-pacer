@@ -211,6 +211,66 @@ def _bucket_source(src: str) -> str:
     return "Referrals / other"
 
 
+def _debug_contact_probe(campaign_guid: str) -> dict:
+    """
+    Uncached diagnostic: makes the actual HTTP calls and returns full response info.
+    Used only in the debug expander — never cached.
+    """
+    today_str = date.today().isoformat()
+    out: dict = {"campaign_guid": campaign_guid}
+
+    # Step 1: contacts endpoint
+    url1 = (
+        f"{HS_BASE}/marketing/v3/campaigns/{campaign_guid}"
+        "/reports/contacts/NEW_CONTACTS_FIRST_TOUCH"
+    )
+    params1 = {"startDate": METRICS_START, "endDate": today_str, "limit": 10}
+    try:
+        r1 = requests.get(url1, headers=_hs_headers(), params=params1, timeout=30)
+        out["contacts_url"]    = r1.url
+        out["contacts_status"] = r1.status_code
+        out["contacts_body"]   = r1.text[:2000]
+        data1 = r1.json() if r1.ok else {}
+        ids = [
+            str(item.get("id") or item.get("contactId", ""))
+            for item in data1.get("results", [])
+            if item.get("id") or item.get("contactId")
+        ]
+        out["contact_ids_found"]  = len(ids)
+        out["contact_ids_sample"] = ids[:5]
+    except Exception as exc:
+        out["contacts_exception"] = str(exc)
+        ids = []
+
+    if not ids:
+        out["batch_read"] = "skipped — contacts endpoint returned 0 IDs"
+        return out
+
+    # Step 2: batch read
+    try:
+        r2 = requests.post(
+            f"{HS_BASE}/crm/v3/objects/contacts/batch/read",
+            headers=_hs_headers(),
+            json={
+                "inputs":     [{"id": cid} for cid in ids],
+                "properties": ["hs_analytics_source", "hs_latest_source"],
+            },
+            timeout=30,
+        )
+        out["batch_status"]        = r2.status_code
+        out["batch_body"]          = r2.text[:2000]
+        data2                      = r2.json() if r2.ok else {}
+        out["batch_results_count"] = len(data2.get("results", []))
+        out["sources_non_null"]    = sum(
+            1 for c in data2.get("results", [])
+            if (c.get("properties") or {}).get("hs_analytics_source")
+        )
+    except Exception as exc:
+        out["batch_exception"] = str(exc)
+
+    return out
+
+
 # ── Data fetchers ──────────────────────────────────────────────────────────────
 
 @st.cache_data(ttl=3600)
@@ -268,13 +328,11 @@ def fetch_contact_ids(campaign_guid: str, attr_type: str) -> list[str]:
         }
         if after:
             params["after"] = after
-        try:
-            data = _hs_get(
-                f"/marketing/v3/campaigns/{campaign_guid}/reports/contacts/{attr_type}",
-                params,
-            )
-        except requests.HTTPError:
-            break
+        # Let HTTP errors propagate — caller catches and records them in id_errors.
+        data = _hs_get(
+            f"/marketing/v3/campaigns/{campaign_guid}/reports/contacts/{attr_type}",
+            params,
+        )
         results = data.get("results", [])
         for item in results:
             cid = item.get("id") or item.get("contactId")
@@ -298,20 +356,18 @@ def fetch_contact_sources_bulk(contact_ids: tuple[str, ...]) -> dict[str, str]:
     ids = list(contact_ids)
     for i in range(0, len(ids), 100):
         chunk = ids[i : i + 100]
-        try:
-            resp = _hs_post(
-                "/crm/v3/objects/contacts/batch/read",
-                {
-                    "inputs":     [{"id": cid} for cid in chunk],
-                    "properties": ["hs_analytics_source", "hs_latest_source"],
-                },
-            )
-            for contact in resp.get("results", []):
-                props = contact.get("properties") or {}
-                src   = props.get("hs_analytics_source") or ""
-                result[str(contact["id"])] = _bucket_source(src)
-        except Exception:
-            pass
+        # Let HTTP errors propagate — caller catches and surfaces them.
+        resp = _hs_post(
+            "/crm/v3/objects/contacts/batch/read",
+            {
+                "inputs":     [{"id": cid} for cid in chunk],
+                "properties": ["hs_analytics_source", "hs_latest_source"],
+            },
+        )
+        for contact in resp.get("results", []):
+            props = contact.get("properties") or {}
+            src   = props.get("hs_analytics_source") or ""
+            result[str(contact["id"])] = _bucket_source(src)
     return result
 
 
@@ -460,8 +516,9 @@ campaign_rows.sort(key=lambda r: r["sort_date"], reverse=True)
 
 # ── Fetch contact IDs for every campaign (both models, 1 h cache) ──────────────
 # Fetch FT + LT for all campaigns upfront so switching the model toggle is instant.
-ft_ids: dict[str, list[str]] = {}   # campaign_id → list[contact_id]
-lt_ids: dict[str, list[str]] = {}
+ft_ids:    dict[str, list[str]] = {}
+lt_ids:    dict[str, list[str]] = {}
+id_errors: dict[str, str]       = {}   # campaign_id → error string, if any
 
 id_bar = st.progress(0, text="Fetching contact IDs…")
 for i, row in enumerate(campaign_rows):
@@ -469,8 +526,17 @@ for i, row in enumerate(campaign_rows):
         (i + 1) / len(campaign_rows),
         text=f"Contact IDs {i + 1}/{len(campaign_rows)}: {row['name']}",
     )
-    ft_ids[row["id"]] = fetch_contact_ids(row["id"], "NEW_CONTACTS_FIRST_TOUCH")
-    lt_ids[row["id"]] = fetch_contact_ids(row["id"], "NEW_CONTACTS_LAST_TOUCH")
+    try:
+        ft_ids[row["id"]] = fetch_contact_ids(row["id"], "NEW_CONTACTS_FIRST_TOUCH")
+    except Exception as exc:
+        ft_ids[row["id"]] = []
+        id_errors[row["id"]] = f"FT fetch failed: {exc}"
+    try:
+        lt_ids[row["id"]] = fetch_contact_ids(row["id"], "NEW_CONTACTS_LAST_TOUCH")
+    except Exception as exc:
+        lt_ids[row["id"]] = []
+        prev = id_errors.get(row["id"], "")
+        id_errors[row["id"]] = (prev + " | " if prev else "") + f"LT fetch failed: {exc}"
 id_bar.empty()
 
 # Deduplicate across both models and bulk-read sources in one shot (24 h cache).
@@ -480,8 +546,13 @@ all_ids: tuple[str, ...] = tuple(sorted({
     for ids in mapping.values()
     for cid in ids
 }))
+sources_lookup: dict[str, str] = {}
+bulk_error: str | None = None
 with st.spinner(f"Loading sources for {len(all_ids):,} unique contacts (cached 24 h)…"):
-    sources_lookup: dict[str, str] = fetch_contact_sources_bulk(all_ids)
+    try:
+        sources_lookup = fetch_contact_sources_bulk(all_ids)
+    except Exception as exc:
+        bulk_error = str(exc)
 
 # Aggregate per campaign using whichever ID list the selected model needs.
 for row in campaign_rows:
@@ -492,45 +563,88 @@ for row in campaign_rows:
         src[bucket] = src.get(bucket, 0) + 1
     row["sources"]    = src
     row["n_contacts"] = len(id_list)
-    row["src_error"]  = None
+
+# Determine whether source data actually loaded before rendering cards or chart.
+sources_available = any(sum(r["sources"].values()) > 0 for r in campaign_rows)
+
+
+# ── Debug expander (always visible so failures are surfaced immediately) ────────
+ft_total = sum(len(v) for v in ft_ids.values())
+lt_total = sum(len(v) for v in lt_ids.values())
+with st.expander(
+    "Debug: contact source diagnostics"
+    + (" ✓" if sources_available else " ✗ — source data missing"),
+    expanded=not sources_available,
+):
+    st.write(f"**Campaigns in filter:** {len(campaign_rows)}")
+    st.write(f"**FT contact IDs returned by API:** {ft_total}")
+    st.write(f"**LT contact IDs returned by API:** {lt_total}")
+    st.write(f"**Unique IDs sent to batch read:** {len(all_ids)}")
+    st.write(f"**Source values resolved:** {len(sources_lookup)}")
+    if id_errors:
+        st.write("**Per-campaign fetch errors:**")
+        for cid, err in id_errors.items():
+            st.write(f"- `{cid}`: {err}")
+    if bulk_error:
+        st.write(f"**Batch read error:** `{bulk_error}`")
+    if campaign_rows:
+        first = campaign_rows[0]
+        st.write(
+            f"**Live probe for:** `{first['name']}` — GUID `{first['id']}`"
+        )
+        with st.spinner("Running probe…"):
+            probe = _debug_contact_probe(first["id"])
+        st.json(probe)
 
 
 # ── Metric cards ───────────────────────────────────────────────────────────────
 total_registrations = sum(r["count"] for r in campaign_rows)
-email_total         = sum(r["sources"].get("Email marketing", 0) for r in campaign_rows)
-email_pct           = email_total / total_registrations if total_registrations else 0
 n_campaigns         = len(campaign_rows)
 
-st.markdown(
-    f'<div class="kpi-band">'
-    f'<div class="kpi-tile">'
-    f'<div class="kpi-label">Net-new contacts</div>'
-    f'<div class="kpi-value">{total_registrations:,}</div>'
-    f'</div>'
-    f'<div class="kpi-tile">'
-    f'<div class="kpi-label">Email-sourced</div>'
-    f'<div class="kpi-value">{email_total:,}</div>'
-    f'</div>'
-    f'<div class="kpi-tile">'
-    f'<div class="kpi-label">Email share</div>'
-    f'<div class="kpi-value">{email_pct:.1%}</div>'
-    f'</div>'
-    f'<div class="kpi-tile">'
-    f'<div class="kpi-label">Campaigns tracked</div>'
-    f'<div class="kpi-value">{n_campaigns}</div>'
-    f'</div>'
-    f'</div>',
-    unsafe_allow_html=True,
-)
+if sources_available:
+    email_total = sum(r["sources"].get("Email marketing", 0) for r in campaign_rows)
+    email_pct   = email_total / total_registrations if total_registrations else 0
+    st.markdown(
+        f'<div class="kpi-band">'
+        f'<div class="kpi-tile">'
+        f'<div class="kpi-label">Net-new contacts</div>'
+        f'<div class="kpi-value">{total_registrations:,}</div>'
+        f'</div>'
+        f'<div class="kpi-tile">'
+        f'<div class="kpi-label">Email-sourced</div>'
+        f'<div class="kpi-value">{email_total:,}</div>'
+        f'</div>'
+        f'<div class="kpi-tile">'
+        f'<div class="kpi-label">Email share</div>'
+        f'<div class="kpi-value">{email_pct:.1%}</div>'
+        f'</div>'
+        f'<div class="kpi-tile">'
+        f'<div class="kpi-label">Campaigns tracked</div>'
+        f'<div class="kpi-value">{n_campaigns}</div>'
+        f'</div>'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
+else:
+    st.markdown(
+        f'<div class="kpi-band">'
+        f'<div class="kpi-tile">'
+        f'<div class="kpi-label">Net-new contacts</div>'
+        f'<div class="kpi-value">{total_registrations:,}</div>'
+        f'</div>'
+        f'<div class="kpi-tile">'
+        f'<div class="kpi-label">Campaigns tracked</div>'
+        f'<div class="kpi-value">{n_campaigns}</div>'
+        f'</div>'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
 
 st.divider()
 
 # ── Horizontal stacked bar chart ───────────────────────────────────────────────
 # Sort ascending by date so Plotly's bottom→top axis puts the newest campaign at the top.
 chart_rows = sorted(campaign_rows, key=lambda r: r["sort_date"])
-
-# If all source lookups returned nothing, fall back to showing registration totals.
-sources_available = any(sum(r["sources"].values()) > 0 for r in chart_rows)
 
 fig = go.Figure()
 if sources_available:
@@ -547,20 +661,20 @@ if sources_available:
             hovertemplate="%{y}<br>" + channel + ": %{x:,d}<extra></extra>",
         ))
 else:
-    # Fallback: show raw registration counts while source data is unavailable.
+    # Source data failed — show error and grey registration totals as placeholder.
+    err_detail = bulk_error or (list(id_errors.values())[0] if id_errors else "0 contact IDs returned from the contacts endpoint")
+    st.error(
+        f"Contact source breakdown unavailable — check the Debug expander above for the full API response. "
+        f"Error: {err_detail}"
+    )
     fig.add_trace(go.Bar(
-        name="Registrations (source breakdown pending)",
+        name="Registrations (source breakdown unavailable)",
         x=[r["count"] for r in chart_rows],
         y=[r["name"] for r in chart_rows],
         orientation="h",
         marker_color=_C["gray_mid"],
         hovertemplate="%{y}<br>Registrations: %{x:,d}<extra></extra>",
     ))
-    first_err = next((r["src_error"] for r in chart_rows if r.get("src_error")), None)
-    if first_err:
-        st.warning(f"Contact source lookup failed — showing registration totals only. Error: {first_err}")
-    else:
-        st.info("Contact source data not yet loaded — showing registration totals. Source breakdown will appear once contacts are fetched.")
 
 fig.update_layout(
     barmode="stack",
