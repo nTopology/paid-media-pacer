@@ -483,9 +483,9 @@ def fetch_total_target_contacts(domains: tuple[str, ...]) -> int:
 def _add_target_annotations(fig: go.Figure) -> None:
     for ann_date, color, text in [
         (date(2025, 2, 1), "#888780",
-         "Feb 2025: bulk list import<br>(~2,300 contacts, under Legal review)"),
+         "Feb 2025: bulk list import<br>(~2,300 contacts)"),
         (date(2026, 5, 1), "#D85A30",
-         "May 2026: explicit opt-in<br>checkboxes added (per Legal)"),
+         "May 2026: explicit opt-in<br>checkboxes added to forms"),
     ]:
         fig.add_vline(x=ann_date, line_dash="dash", line_color=color, line_width=1)
         fig.add_annotation(
@@ -860,20 +860,20 @@ else:
         'line-height:1.6;color:#633806;margin-bottom:24px;">'
         "<strong>Compliance context for this data:</strong><br><br>"
         "A bulk import of ~2,300 contacts in Feb 2025 accounts for 86% of the current "
-        "target-account marketing audience. The origin of this import is under review by Legal "
-        "because contacts added via purchased or third-party lists may not have provided consent "
-        "to receive marketing communications from nTop.<br><br>"
-        "Regulatory exposure varies by jurisdiction:<br><br>"
+        "target-account marketing audience. Contacts added via purchased or third-party lists "
+        "may not have provided consent to receive marketing communications from nTop, which "
+        "creates regulatory exposure that varies by jurisdiction:<br><br>"
         "&bull; <strong>EU/UK contacts (GDPR):</strong> generally require explicit consent or a "
         "defensible legitimate-interest basis. Penalties up to &euro;20M or 4% of global revenue.<br>"
         "&bull; <strong>Canadian contacts (CASL):</strong> require express or implied consent; "
         "implied consent expires after 2 years without an active business relationship.<br>"
         "&bull; <strong>US contacts (CAN-SPAM):</strong> more permissive; opt-in not required for "
         "B2B, but unsubscribe and accurate sender info must function.<br><br>"
-        "<strong>Recommended actions while review is pending:</strong> do not delete records "
-        "(some regulations require retention), do not send to the EU/UK subset of this audience "
-        "until consent is verified or a re-consent campaign has been run, and confirm provenance "
-        "with whoever executed the import."
+        "<strong>Suggested precautions:</strong> do not delete records "
+        "(some regulations require retention), avoid sending to the EU/UK subset of this audience "
+        "until consent has been verified or a re-consent campaign has been run, and confirm the "
+        "provenance of the import with whoever executed it. Loop in whoever owns compliance at "
+        "nTop before making decisions about this audience."
         "</div>",
         unsafe_allow_html=True,
     )
@@ -1004,7 +1004,7 @@ else:
         'font-size:13px;line-height:1.6;margin-top:24px;">'
         "<strong>Data notes:</strong><br><br>"
         "&bull; <strong>May 2026 forward:</strong> All forms now include unticked opt-in "
-        "checkboxes for marketing communications, per Legal. Contacts post-May 2026 represent "
+        "checkboxes for marketing communications. Contacts post-May 2026 represent "
         "active opt-ins only, not implicit consent. Expect lower per-month numbers going forward; "
         "this is a data quality improvement, not a performance regression.<br><br>"
         "&bull; <strong>What this view shows:</strong> Current marketing contacts grouped by "
