@@ -8,13 +8,20 @@ from __future__ import annotations
 
 import base64
 import json
-from datetime import date
+from datetime import date, datetime, timezone
 from pathlib import Path
 
 import pandas as pd
 import plotly.graph_objects as go
 import requests
 import streamlit as st
+
+try:
+    from google.cloud import bigquery as _bq
+    from google.oauth2 import service_account as _gcp_sa
+    _HAS_BQ = True
+except ImportError:
+    _HAS_BQ = False
 
 
 # ── Brand assets ───────────────────────────────────────────────────────────────
@@ -309,6 +316,182 @@ def fetch_contact_sources_bulk(contact_ids: tuple[str, ...]) -> dict[str, str]:
             src   = props.get("hs_analytics_source") or ""
             result[str(contact["id"])] = _bucket_source(src)
     return result
+
+
+# ── BigQuery client (reuses credentials pattern from page 2) ─────────────────
+_GCP_PROJECT = "bi-ntop"
+
+
+@st.cache_resource
+def _get_bq_client():
+    if not _HAS_BQ:
+        return None
+    scopes = ["https://www.googleapis.com/auth/cloud-platform"]
+    if "gcp_service_account" in st.secrets:
+        creds = _gcp_sa.Credentials.from_service_account_info(
+            st.secrets["gcp_service_account"], scopes=scopes,
+        )
+    else:
+        creds = _gcp_sa.Credentials.from_service_account_file(
+            "service-account.json", scopes=scopes,
+        )
+    return _bq.Client(credentials=creds, project=_GCP_PROJECT)
+
+
+# ── Target Account helpers ────────────────────────────────────────────────────
+
+def _clean_domain(raw: str) -> str:
+    d = raw.strip().lower()
+    for prefix in ("https://", "http://"):
+        if d.startswith(prefix):
+            d = d[len(prefix):]
+    if d.startswith("www."):
+        d = d[4:]
+    return d.split("/")[0].rstrip(".")
+
+
+@st.cache_data(ttl=86400)
+def fetch_target_domains() -> dict:
+    """
+    Fetch target-account domains from HubSpot companies (primary) and
+    Salesforce via BigQuery (secondary). Cached 24 h.
+    """
+    aero: set[str] = set()
+    turbo: set[str] = set()
+
+    for prop, bucket in [
+        ("aircraft_concept_target_type", aero),
+        ("turbomachinery_target_type", turbo),
+    ]:
+        after: int = 0
+        while True:
+            payload: dict = {
+                "filterGroups": [{"filters": [
+                    {"propertyName": prop, "operator": "HAS_PROPERTY"},
+                ]}],
+                "properties": ["domain"],
+                "limit": 100,
+            }
+            if after:
+                payload["after"] = after
+            data = _hs_post("/crm/v3/objects/companies/search", payload)
+            for co in data.get("results", []):
+                d = (co.get("properties") or {}).get("domain", "")
+                if d:
+                    bucket.add(_clean_domain(d))
+            paging = (data.get("paging") or {}).get("next", {}).get("after")
+            if not paging:
+                break
+            after = int(paging)
+
+    hs_all = aero | turbo
+
+    # Salesforce domains from BigQuery (secondary — for sync-diff logging)
+    sf_all: set[str] = set()
+    sf_error: str | None = None
+    client = _get_bq_client() if _HAS_BQ else None
+    if client is not None:
+        try:
+            col_df = client.query(
+                "SELECT column_name "
+                "FROM `bi-ntop.salesforce.INFORMATION_SCHEMA.COLUMNS` "
+                "WHERE table_name = 'account' AND ("
+                "LOWER(column_name) LIKE '%target_type%' "
+                "OR LOWER(column_name) LIKE '%aircraft%target%' "
+                "OR LOWER(column_name) LIKE '%turbomachinery%target%')"
+            ).to_dataframe(create_bqstorage_client=False)
+            target_cols = col_df["column_name"].tolist()
+            if target_cols:
+                where = " OR ".join(f"`{c}` IS NOT NULL" for c in target_cols)
+                df = client.query(
+                    f"SELECT DISTINCT website "
+                    f"FROM `bi-ntop.salesforce.account` "
+                    f"WHERE ({where}) AND website IS NOT NULL "
+                    f"AND _fivetran_deleted = FALSE"
+                ).to_dataframe(create_bqstorage_client=False)
+                sf_all = {_clean_domain(str(w)) for w in df["website"] if w}
+            else:
+                sf_error = "No target-type columns found on Salesforce account table"
+        except Exception as exc:
+            sf_error = str(exc)
+    else:
+        sf_error = "BigQuery not available"
+
+    combined = hs_all | sf_all
+    return {
+        "aero": sorted(aero), "turbo": sorted(turbo), "all": sorted(combined),
+        "hs_count": len(hs_all), "sf_count": len(sf_all),
+        "hs_only": sorted(hs_all - sf_all) if sf_all else [],
+        "sf_only": sorted(sf_all - hs_all) if sf_all else [],
+        "sf_error": sf_error,
+    }
+
+
+def _count_contacts_for_domains(
+    domains: tuple[str, ...],
+    start_ms: str | None = None,
+    end_ms: str | None = None,
+) -> int:
+    """
+    Count marketing contacts whose hs_email_domain is in the domain set.
+    Chunks domains ≤100 per IN filter; batches ≤5 filter groups per API call.
+    """
+    if not domains:
+        return 0
+    domain_list = list(domains)
+    chunks = [domain_list[i : i + 100] for i in range(0, len(domain_list), 100)]
+
+    total = 0
+    for batch_start in range(0, len(chunks), 5):
+        batch = chunks[batch_start : batch_start + 5]
+        filter_groups: list[dict] = []
+        for chunk in batch:
+            filters: list[dict] = [
+                {"propertyName": "hs_marketable_status", "operator": "EQ", "value": "true"},
+                {"propertyName": "hs_email_domain", "operator": "IN", "values": chunk},
+            ]
+            if start_ms is not None:
+                filters.append({"propertyName": "createdate", "operator": "GTE", "value": start_ms})
+            if end_ms is not None:
+                filters.append({"propertyName": "createdate", "operator": "LT", "value": end_ms})
+            filter_groups.append({"filters": filters})
+
+        data = _hs_post("/crm/v3/objects/contacts/search", {
+            "filterGroups": filter_groups,
+            "limit": 1,
+        })
+        total += data.get("total", 0)
+    return total
+
+
+@st.cache_data(ttl=3600)
+def _count_month(domains: tuple[str, ...], year: int, month: int) -> int:
+    start = datetime(year, month, 1, tzinfo=timezone.utc)
+    end = datetime(year + (1 if month == 12 else 0), (month % 12) + 1, 1, tzinfo=timezone.utc)
+    return _count_contacts_for_domains(
+        domains,
+        str(int(start.timestamp() * 1000)),
+        str(int(end.timestamp() * 1000)),
+    )
+
+
+@st.cache_data(ttl=3600)
+def fetch_total_target_contacts(domains: tuple[str, ...]) -> int:
+    return _count_contacts_for_domains(domains, None, None)
+
+
+def _add_target_annotations(fig: go.Figure) -> None:
+    for ann_date, color, text in [
+        (date(2025, 2, 1), "#888780",
+         "Feb 2025: bulk list import<br>(~2,300 contacts, under Legal review)"),
+        (date(2026, 5, 1), "#D85A30",
+         "May 2026: explicit opt-in<br>checkboxes added (per Legal)"),
+    ]:
+        fig.add_vline(x=ann_date, line_dash="dash", line_color=color, line_width=1)
+        fig.add_annotation(
+            x=ann_date, y=1.05, yref="paper", text=text, showarrow=False,
+            font=dict(size=10, color=color, family="IBM Plex Sans"), xanchor="left",
+        )
 
 
 # ── Page setup ─────────────────────────────────────────────────────────────────
@@ -626,6 +809,193 @@ with st.expander("Per-campaign breakdown", expanded=True):
             **{ch: src.get(ch, 0) for ch in CHANNEL_ORDER},
         })
     st.dataframe(pd.DataFrame(table_rows), use_container_width=True, hide_index=True)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TARGET ACCOUNT ADDRESSABLE AUDIENCE
+# ═══════════════════════════════════════════════════════════════════════════════
+
+st.divider()
+st.subheader("Target Account Addressable Audience")
+
+ta_segment = st.radio(
+    "Segment", ["Both", "Aerospace", "Turbomachinery"], horizontal=True, key="ta_seg",
+)
+
+with st.spinner("Loading target account domains (cached 24 h)…"):
+    domain_data = fetch_target_domains()
+
+if ta_segment == "Aerospace":
+    ta_domains = tuple(domain_data["aero"])
+elif ta_segment == "Turbomachinery":
+    ta_domains = tuple(domain_data["turbo"])
+else:
+    ta_domains = tuple(domain_data["all"])
+
+if not ta_domains:
+    st.warning("No target account domains found for this segment.")
+else:
+    # ── Compliance callout ────────────────────────────────────────────────────
+    st.markdown(
+        '<div style="background:#FAEEDA;border-left:4px solid #D85A30;'
+        'border-radius:0 8px 8px 0;padding:1rem 1.25rem;font-size:13px;'
+        'line-height:1.6;color:#633806;margin-bottom:24px;">'
+        "<strong>Compliance context for this data:</strong><br><br>"
+        "A bulk import of ~2,300 contacts in Feb 2025 accounts for 86% of the current "
+        "target-account marketing audience. The origin of this import is under review by Legal "
+        "because contacts added via purchased or third-party lists may not have provided consent "
+        "to receive marketing communications from nTop.<br><br>"
+        "Regulatory exposure varies by jurisdiction:<br><br>"
+        "&bull; <strong>EU/UK contacts (GDPR):</strong> generally require explicit consent or a "
+        "defensible legitimate-interest basis. Penalties up to &euro;20M or 4% of global revenue.<br>"
+        "&bull; <strong>Canadian contacts (CASL):</strong> require express or implied consent; "
+        "implied consent expires after 2 years without an active business relationship.<br>"
+        "&bull; <strong>US contacts (CAN-SPAM):</strong> more permissive; opt-in not required for "
+        "B2B, but unsubscribe and accurate sender info must function.<br><br>"
+        "<strong>Recommended actions while review is pending:</strong> do not delete records "
+        "(some regulations require retention), do not send to the EU/UK subset of this audience "
+        "until consent is verified or a re-consent campaign has been run, and confirm provenance "
+        "with whoever executed the import."
+        "</div>",
+        unsafe_allow_html=True,
+    )
+
+    # ── Monthly trend data ────────────────────────────────────────────────────
+    _today = date.today()
+    _months: list[tuple[int, int]] = []
+    for _i in range(23, -1, -1):
+        _y, _m = _today.year, _today.month - _i
+        while _m <= 0:
+            _m += 12
+            _y -= 1
+        _months.append((_y, _m))
+
+    monthly_counts: list[dict] = []
+    _month_bar = st.progress(0, text="Loading monthly target account contacts…")
+    for _idx, (_y, _m) in enumerate(_months):
+        _month_bar.progress(
+            (_idx + 1) / len(_months),
+            text=f"Month {_idx + 1}/{len(_months)}: {date(_y, _m, 1).strftime('%b %Y')}",
+        )
+        _cnt = _count_month(ta_domains, _y, _m)
+        monthly_counts.append({
+            "year": _y, "month": _m,
+            "label": date(_y, _m, 1).strftime("%b %Y"),
+            "date": date(_y, _m, 1),
+            "count": _cnt,
+        })
+    _month_bar.empty()
+
+    with st.spinner("Loading current total…"):
+        ta_current_total = fetch_total_target_contacts(ta_domains)
+
+    # ── Metric cards ──────────────────────────────────────────────────────────
+    ta_last_3 = sum(mc["count"] for mc in monthly_counts[-3:])
+    ta_avg_6 = sum(mc["count"] for mc in monthly_counts[-6:]) / 6 if len(monthly_counts) >= 6 else 0
+
+    st.markdown(
+        f'<div class="kpi-band">'
+        f'<div class="kpi-tile">'
+        f'<div class="kpi-label">Marketing contacts today</div>'
+        f'<div class="kpi-value">{ta_current_total:,}{"+" if ta_current_total >= 10001 else ""}</div>'
+        f'</div>'
+        f'<div class="kpi-tile">'
+        f'<div class="kpi-label">Added last 3 months</div>'
+        f'<div class="kpi-value">{ta_last_3:,}</div>'
+        f'</div>'
+        f'<div class="kpi-tile">'
+        f'<div class="kpi-label">Avg monthly run rate (6 mo)</div>'
+        f'<div class="kpi-value">{ta_avg_6:,.0f}</div>'
+        f'</div>'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
+
+    # ── Cumulative line chart ─────────────────────────────────────────────────
+    _x_dates = [mc["date"] for mc in monthly_counts]
+    _cumulative: list[int] = []
+    _running = 0
+    for mc in monthly_counts:
+        _running += mc["count"]
+        _cumulative.append(_running)
+
+    fig_cum = go.Figure()
+    fig_cum.add_trace(go.Scatter(
+        x=_x_dates, y=_cumulative, mode="lines",
+        line=dict(color="#1D9E75", width=2.5),
+        fill="tozeroy", fillcolor="rgba(29,158,117,0.10)",
+        hovertemplate="%{x|%b %Y}<br>Cumulative: %{y:,d}<extra></extra>",
+    ))
+    _add_target_annotations(fig_cum)
+    fig_cum.update_layout(
+        height=350,
+        margin=dict(l=20, r=20, t=60, b=40),
+        xaxis=dict(title=None, dtick="M3", tickformat="%b %Y"),
+        yaxis=dict(title="Cumulative marketing contacts", showgrid=True, gridcolor="#F0F0F0"),
+        plot_bgcolor="white", paper_bgcolor="white",
+    )
+    st.plotly_chart(fig_cum, use_container_width=True)
+
+    # ── Monthly bar chart (log scale) ─────────────────────────────────────────
+    _bar_colors = ["#7F77DD" if mc["count"] > 100 else "#1D9E75" for mc in monthly_counts]
+
+    fig_bar_ta = go.Figure()
+    fig_bar_ta.add_trace(go.Bar(
+        x=_x_dates,
+        y=[mc["count"] for mc in monthly_counts],
+        marker_color=_bar_colors,
+        hovertemplate="%{x|%b %Y}<br>Added: %{y:,d}<extra></extra>",
+    ))
+    _add_target_annotations(fig_bar_ta)
+    fig_bar_ta.update_layout(
+        height=350,
+        margin=dict(l=20, r=20, t=60, b=40),
+        xaxis=dict(title=None, dtick="M3", tickformat="%b %Y"),
+        yaxis=dict(
+            title="Net-new contacts (log scale)", type="log",
+            showgrid=True, gridcolor="#F0F0F0",
+        ),
+        plot_bgcolor="white", paper_bgcolor="white",
+    )
+    st.plotly_chart(fig_bar_ta, use_container_width=True)
+
+    # ── Data notes callout ────────────────────────────────────────────────────
+    st.markdown(
+        '<div style="background:#f5f5f4;border-radius:8px;padding:1rem 1.25rem;'
+        'font-size:13px;line-height:1.6;margin-top:24px;">'
+        "<strong>Data notes:</strong><br><br>"
+        "&bull; <strong>May 2026 forward:</strong> All forms now include unticked opt-in "
+        "checkboxes for marketing communications, per Legal. Contacts post-May 2026 represent "
+        "active opt-ins only, not implicit consent. Expect lower per-month numbers going forward; "
+        "this is a data quality improvement, not a performance regression.<br><br>"
+        "&bull; <strong>What this view shows:</strong> Current marketing contacts grouped by "
+        "creation date. Contacts whose marketing-status was toggled off later are excluded. "
+        "HubSpot does not store historical snapshots, so true list-size-over-time would require "
+        "ongoing snapshot tracking."
+        "</div>",
+        unsafe_allow_html=True,
+    )
+
+    # ── HubSpot / Salesforce sync diff ────────────────────────────────────────
+    if domain_data.get("sf_error"):
+        st.caption(f"Salesforce comparison: {domain_data['sf_error']}")
+    elif domain_data.get("hs_only") or domain_data.get("sf_only"):
+        with st.expander(
+            f"HubSpot / Salesforce domain diff "
+            f"(HS-only: {len(domain_data['hs_only'])}, SF-only: {len(domain_data['sf_only'])})"
+        ):
+            if domain_data["hs_only"]:
+                st.write(
+                    f"**HubSpot only ({len(domain_data['hs_only'])}):** "
+                    + ", ".join(domain_data["hs_only"][:30])
+                    + ("…" if len(domain_data["hs_only"]) > 30 else "")
+                )
+            if domain_data["sf_only"]:
+                st.write(
+                    f"**Salesforce only ({len(domain_data['sf_only'])}):** "
+                    + ", ".join(domain_data["sf_only"][:30])
+                    + ("…" if len(domain_data["sf_only"]) > 30 else "")
+                )
 
 
 # ── Footer ─────────────────────────────────────────────────────────────────────
