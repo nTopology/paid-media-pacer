@@ -233,32 +233,17 @@ def fetch_ev_wn_campaigns() -> list[dict]:
 
 
 @st.cache_data(ttl=3600)
-def fetch_campaign_metrics(campaign_id: str) -> dict[str, int]:
+def fetch_campaign_metrics(campaign_id: str, start_date: str, end_date: str) -> dict:
     """
-    Return newContactsFirstTouch and newContactsLastTouch counts.
-    Explicit date range is required — HubSpot defaults to the event day only
-    and returns zeros without it.
+    Return raw metrics dict from HubSpot for this campaign.
+    start_date and end_date are explicit args so they're part of the cache key
+    (avoids replaying a stale zero result from a previous date range).
     """
-    today_str = date.today().isoformat()
     data = _hs_get(
         f"/marketing/v3/campaigns/{campaign_id}/reports/metrics",
-        {"startDate": METRICS_START, "endDate": today_str},
+        {"startDate": start_date, "endDate": end_date},
     )
-    result: dict[str, int] = {"newContactsFirstTouch": 0, "newContactsLastTouch": 0}
-
-    # Handle both list-of-metrics and flat-dict response shapes
-    metrics_raw = data.get("metrics") or data.get("results") or []
-    if isinstance(metrics_raw, list):
-        for m in metrics_raw:
-            key = m.get("metric") or m.get("name") or ""
-            if key in result:
-                result[key] = int(m.get("value", 0) or 0)
-    elif isinstance(metrics_raw, dict):
-        for key in result:
-            if key in metrics_raw:
-                result[key] = int(metrics_raw[key] or 0)
-
-    return result
+    return data  # return raw so callers can inspect the full shape
 
 
 @st.cache_data(ttl=86400)
@@ -433,6 +418,7 @@ if not campaigns:
 
 
 # ── Fetch campaign metrics (fast, 1 h cache) ───────────────────────────────────
+today_str = date.today().isoformat()
 campaign_rows: list[dict] = []
 metrics_bar = st.progress(0, text="Loading campaign metrics…")
 
@@ -442,25 +428,35 @@ for i, c in enumerate(campaigns):
         text=f"Metrics {i + 1}/{len(campaigns)}: {c.get('name', c['id'])}",
     )
     try:
-        metrics = fetch_campaign_metrics(c["id"])
+        raw = fetch_campaign_metrics(c["id"], METRICS_START, today_str)
+        # HubSpot returns {"metrics": {"newContactsFirstTouch": N, ...}}
+        m = raw.get("metrics") or {}
+        if isinstance(m, list):  # guard against unexpected list shape
+            m = {item.get("metric") or item.get("name"): item.get("value", 0) for item in m}
+        ft = int(m.get("newContactsFirstTouch", 0) or 0)
+        lt = int(m.get("newContactsLastTouch",  0) or 0)
+        metrics_error = None
     except Exception as _exc:
-        metrics = {"newContactsFirstTouch": 0, "newContactsLastTouch": 0, "_error": str(_exc)}
+        ft, lt, raw = 0, 0, {}
+        metrics_error = str(_exc)
 
     name      = c.get("name", "")
-    # Prefer startDate, fall back to createdAt; both may be ISO strings or epoch ms
-    start_raw = c.get("startDate") or c.get("createdAt") or ""
     try:
-        sort_date = pd.to_datetime(start_raw, unit="ms" if str(start_raw).isdigit() else None).date()
+        # Parse YYYY-MM-DD from name (e.g. EV-2025-06-24-...)
+        date_part = "-".join(name.split("-")[1:4])
+        sort_date = date.fromisoformat(date_part)
     except Exception:
         sort_date = date.min
 
     campaign_rows.append({
-        "id":        c["id"],
-        "name":      name,
-        "type":      "Event" if name.startswith("EV-") else "Webinar",
-        "sort_date": sort_date,
-        "ft_count":  int(metrics.get("newContactsFirstTouch", 0)),
-        "lt_count":  int(metrics.get("newContactsLastTouch",  0)),
+        "id":         c["id"],
+        "name":       name,
+        "type":       "Event" if name.startswith("EV-") else "Webinar",
+        "sort_date":  sort_date,
+        "ft_count":   ft,
+        "lt_count":   lt,
+        "_raw":       raw,
+        "_error":     metrics_error,
     })
 
 metrics_bar.empty()
@@ -473,14 +469,12 @@ campaign_rows_all = campaign_rows  # keep unfiltered copy for diagnostics
 campaign_rows = [r for r in campaign_rows if r["count"] > 0]
 
 if not campaign_rows:
-    errors = [r for r in campaign_rows_all if r.get("_error")]
-    sample = next((r for r in campaign_rows_all if r.get("_error")), None)
-    if sample:
-        st.error(f"Metrics endpoint error (first campaign): {sample['_error']}")
+    first = campaign_rows_all[0] if campaign_rows_all else {}
+    if first.get("_error"):
+        st.error(f"Metrics API error: {first['_error']}")
     else:
-        totals = [(r["name"], r["ft_count"], r["lt_count"]) for r in campaign_rows_all[:5]]
-        st.warning("All campaigns returned 0 registrations. Sample counts:")
-        st.write(totals)
+        st.warning("All campaigns returned 0 registrations. Raw API response for first campaign:")
+        st.json(first.get("_raw", {}))
     st.stop()
 
 # Sort descending by date for the table (most recent first)
