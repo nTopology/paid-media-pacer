@@ -7,5 +7,6 @@ pg = st.navigation([
     st.Page("pages/2_Paid_to_Pipeline.py", title="Paid to Pipeline"),
     st.Page("pages/3_Event_Attribution.py", title="Event & Webinar Attribution"),
     st.Page("pages/4_Web_Traffic.py", title="Web Traffic"),
+    st.Page("pages/5_Brian_View.py", title="Web Traffic (Brian View)"),
 ])
 pg.run()
