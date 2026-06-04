@@ -137,7 +137,7 @@ section[data-testid="stSidebar"] div {{
 
 /* ── Tighten Streamlit default spacing ─────────────────────────────────── */
 .block-container {{
-    padding-top: 1.5rem;
+    padding-top: 2.5rem;
     padding-bottom: 1rem;
 }}
 [data-testid="stVerticalBlock"] > [data-testid="stVerticalBlockBorderWrapper"] {{
