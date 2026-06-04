@@ -277,7 +277,7 @@ div[data-testid="stHorizontalBlock"] > div {{
 
 
 # ── Page setup ───────────────────────────────────────────────────────────────
-st.set_page_config(page_title="Brian View", layout="wide")
+st.set_page_config(page_title="Web Traffic (Brian View)", layout="wide")
 st.markdown(_BRAND_CSS, unsafe_allow_html=True)
 
 if _PNG_FILE.exists():
