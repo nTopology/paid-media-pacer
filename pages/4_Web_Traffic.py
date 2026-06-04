@@ -562,3 +562,126 @@ else:
             )
     else:
         st.info("Select one or more companies above to see their traffic.")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SECTION 4 — Traffic by Page (GA4)
+# ══════════════════════════════════════════════════════════════════════════════
+st.markdown("---")
+st.subheader("Traffic by Page (GA4, all visitors)")
+
+
+@st.cache_data(ttl=3600)
+def load_page_list() -> pd.DataFrame:
+    """Distinct page paths with total views, for the searchable dropdown."""
+    query = """
+    SELECT
+      REGEXP_REPLACE(
+        REGEXP_REPLACE(JSON_VALUE(features, '$.page_url'), r'^https?://[^/]+', ''),
+        r'\\?.*', ''
+      ) AS page_path,
+      COUNT(*) AS total_views
+    FROM `bi-ntop.aero_prod.ga4_events`
+    WHERE activity = 'page_view'
+      AND DATE(ts) >= '2025-04-16'
+    GROUP BY page_path
+    HAVING page_path IS NOT NULL AND page_path != ''
+    ORDER BY total_views DESC
+    """
+    return _run(query)
+
+
+@st.cache_data(ttl=3600)
+def load_page_traffic(grain: str, page_paths: tuple[str, ...]) -> pd.DataFrame:
+    """Time-series page views for selected page paths."""
+    if not page_paths:
+        return pd.DataFrame(columns=["period", "page_path", "page_views"])
+    placeholders = ", ".join(f"'{p}'" for p in page_paths)
+    trunc = _trunc_expr("ts", grain)
+    query = f"""
+    SELECT
+      {trunc} AS period,
+      REGEXP_REPLACE(
+        REGEXP_REPLACE(JSON_VALUE(features, '$.page_url'), r'^https?://[^/]+', ''),
+        r'\\?.*', ''
+      ) AS page_path,
+      COUNT(*) AS page_views
+    FROM `bi-ntop.aero_prod.ga4_events`
+    WHERE activity = 'page_view'
+      AND DATE(ts) >= '2025-04-16'
+      AND REGEXP_REPLACE(
+        REGEXP_REPLACE(JSON_VALUE(features, '$.page_url'), r'^https?://[^/]+', ''),
+        r'\\?.*', ''
+      ) IN ({placeholders})
+    GROUP BY period, page_path
+    ORDER BY period
+    """
+    df = _run(query)
+    if not df.empty:
+        df["period"] = pd.to_datetime(df["period"]).dt.date
+    return df
+
+
+with st.spinner("Loading page list…"):
+    page_list_df = load_page_list()
+
+if page_list_df.empty:
+    st.warning("No GA4 page view data found.")
+else:
+    # Build display labels: path + view count for context
+    page_list_df = page_list_df.dropna(subset=["page_path"])
+    page_paths_sorted = page_list_df["page_path"].tolist()
+
+    selected_pages = st.multiselect(
+        "Search and select pages",
+        options=page_paths_sorted,
+        default=[],
+        key="page_select",
+        placeholder="Type to search pages (e.g. /request-a-demo/)…",
+    )
+
+    grain_page = st.radio(
+        "Time grain", ["Daily", "Weekly", "Monthly"],
+        index=1, horizontal=True, key="grain_page",
+    )
+
+    if selected_pages:
+        with st.spinner("Loading page traffic…"):
+            page_ts_df = load_page_traffic(grain_page, tuple(selected_pages))
+
+        if not page_ts_df.empty:
+            fig4 = go.Figure()
+            for i, path in enumerate(selected_pages):
+                p_df = page_ts_df[page_ts_df["page_path"] == path]
+                if p_df.empty:
+                    continue
+                fig4.add_trace(go.Scatter(
+                    x=p_df["period"], y=p_df["page_views"],
+                    mode="lines+markers",
+                    name=path,
+                    line=dict(color=COMPANY_COLORS[i % len(COMPANY_COLORS)], width=2),
+                    marker=dict(size=4),
+                    hovertemplate=f"%{{x}}: %{{y:,d}} views<extra>{path}</extra>",
+                ))
+            _base_layout(fig4, "Page views per period by page", grain_page, height=450)
+            st.plotly_chart(fig4, use_container_width=True)
+        else:
+            st.info("No traffic data found for the selected pages.")
+
+        # Companion table — summary stats per selected page
+        summary_rows = []
+        for path in selected_pages:
+            row = page_list_df[page_list_df["page_path"] == path]
+            if row.empty:
+                continue
+            summary_rows.append({
+                "Page": path,
+                "Total Views": int(row["total_views"].iloc[0]),
+            })
+        if summary_rows:
+            summary_df = pd.DataFrame(summary_rows).sort_values(
+                "Total Views", ascending=False
+            )
+            st.dataframe(summary_df, use_container_width=True, hide_index=True)
+    else:
+        st.info("Select one or more pages above to see their traffic.")
