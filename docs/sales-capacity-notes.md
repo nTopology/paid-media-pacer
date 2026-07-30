@@ -52,25 +52,27 @@ Case-insensitive matching on the call bucket is required — direction markers a
 
 **Thresholds.** High effort = 3+ outbound touches to a contact (Jai's benchmark). High intent = at least one `email_in` reply or one non-recurring meeting.
 
-**Rep roster.** Every per-rep figure divides by the reps selected in the sidebar, defaulting to `DEFAULT_REP_ROSTER` — the seven people actually doing outbound:
+**Teams.** Outreach splits into three motions in `TEAMS`, and every per-rep figure divides *within* a team. The weekly trend charts them as separate lines.
 
-| Rep | Outbound, 2026 YTD |
-|---|---|
-| Laurel Berger | 2,859 |
-| Evan Boyer | 2,739 |
-| Taha Benhaddou | 1,653 |
-| Cheyenne Cullen | 1,515 |
-| Albright Tshisekedi | 1,235 |
-| Addison Berenzweig | 854 |
-| James Gibbons | 259 |
+| Team | Members | What it is | Outbound 2026 | Meetings / 1k |
+|---|---|---|---|---|
+| **Reps** | Addison Berenzweig, Evan Boyer, James Gibbons | New business. The team the capacity question is about. | 3,795 | 180–253 |
+| **ABM** | Laurel Berger | High-volume account programme. Ran hard Feb–Apr against largely freshly-imported contacts. | 2,859 | **1.0** |
+| **CS** | Taha Benhaddou, Cheyenne Cullen, Albright Tshisekedi, Neil Brayman | Customer success outreach to existing customers. High reply rates are expected here. | 5,484 | 36–382 |
 
-This has to be an explicit list. `user.title` is blank for five of the seven, there is no `user_role` table in the warehouse, and everyone is on an `@ntop.com` address with a Standard licence — so no field separates the outbound team from the CEO or a Solutions Engineer who owns a couple of logged emails.
+This has to be an explicit mapping. `user.title` is blank for most of these people, there is no `user_role` table in the warehouse, and everyone is on an `@ntop.com` Standard licence — so no field separates a rep from the CEO or a Solutions Engineer who owns a couple of logged emails.
 
-The original spec's `COUNT(DISTINCT owner_id)` counted **all 41 touch owners** — including the CEO (108 outbound), VP Finance (11), General Counsel (26), Director of Accounting (13), plus 10 people with zero outbound who appear only because they attended a meeting. That understated outbound per rep by roughly 3x: 14.2 for the week of Jul 20 against 27.3 on the correct denominator.
+**Why teams and not one roster.** A single blended "outbound per rep" is what let the ABM programme read as team-wide capacity: it added ~2,200 contacts a month at the top of the funnel and almost nothing at the bottom, so the Feb–Apr spike looked like peak effort and the return to baseline looked like a decline. Charting the motions separately makes that visible without anyone needing to know the backstory.
 
-`KNOWN_NON_REPS` holds four people who clear the 250-outbound review threshold but are deliberately off the roster (Neil Brayman, CSM; Andrew Hanno, VP Marketing, departed; Joel Bejar, VP Sales; Hemant Bhoosnurmath, Solutions Engineer). They're listed so the staleness check below stays quiet about known cases, and surfaced in a caption so their volume isn't hidden.
+The original spec's `COUNT(DISTINCT owner_id)` counted **all 41 touch owners** — including the CEO (108 outbound), VP Finance (11), General Counsel (26), Director of Accounting (13), plus 10 people with zero outbound who appear only because they attended a meeting. That understated outbound per rep by roughly 3x.
 
-**Roster staleness check.** An explicit list goes stale the moment someone is hired, so the page warns when anyone outside the selection logs `ROSTER_REVIEW_THRESHOLD` (250) or more outbound touches in the window and isn't in `KNOWN_NON_REPS`. Add them to the roster or to the known-non-reps list; don't ignore it.
+**`EXCLUDED_OWNERS` — counted nowhere.** Andrew Hanno (VP Marketing, since departed — activity isn't comparable to a carrying rep's), Joel Bejar (VP Sales — relationship support only, not carrying a patch), Hemant Bhoosnurmath (Solutions Engineer — technical support on live deals). Their volume is surfaced in an "excluded by design" caption rather than hidden.
+
+**Roster staleness check.** An explicit mapping goes stale the moment someone is hired, so the page warns when anyone outside the selected teams logs `ROSTER_REVIEW_THRESHOLD` (250) or more outbound touches in the window and isn't in `EXCLUDED_OWNERS`. Add them to `TEAMS` or to `EXCLUDED_OWNERS`; don't ignore it.
+
+**Channels.** `CHANNELS` maps the sidebar filter onto the touch-type codes the SQL emits. Effort respects the filter; **replies and meetings never do** — they're outcomes, not channels, so narrowing to LinkedIn changes how much effort is counted, not whether the contact responded.
+
+2026 volumes are lopsided: email 13,693, LinkedIn 209, calls 86, other action items 107. The filter works, but a LinkedIn or call trend line is directional at best.
 
 Ops and system owners are excluded everywhere: `Revenue Operations`, `Hubspot Integration`, `Service Account Marketo`, `CS Team`, plus anything matching `%Integration%` or `%Service Account%`. The roster is an allowlist, so it subsumes that exclusion — a service account can never be on it. Deliberately **not** filtered on `is_active` — departed reps still own historical touches, and excluding them would make past weeks look artificially quiet.
 
@@ -107,6 +109,8 @@ Every one of these was hit during the original analysis. Each is handled in code
 5. **Do not use email body length as a quality proxy.** `task.description` contains the full quoted thread, so length grows with reply depth, not writing effort. The apparent length/intent correlation is an artifact.
 6. **`hubspot.form`'s primary key is `guid`, not `id`.** Join `contact_form_submission.form_id = form.guid`.
 7. **`_fivetran_deleted = FALSE` on every `salesforce.*` and HubSpot core-entity table.** HubSpot bridge/event tables (`contact_form_submission`, `email_event`) do not have this column.
+8. **`[Outreach] [Call]` carries a direction marker, and it isn't always outbound.** The original loose match `LIKE '%[outreach] [call]%'` counted 27 inbound calls in 2026 as outbound touches. Direction is now matched explicitly; inbound calls get their own non-outbound bucket rather than being silently dropped.
+9. **`LinkedIn: View a Profile` is passive research, not outreach.** 34 in 2026, previously swallowed by the catch-all `[Outreach] [Other]%` bucket and counted as touches. Its `CASE` branch must stay above the generic Other branch or it gets re-absorbed.
 
 ---
 
@@ -114,19 +118,23 @@ Every one of these was hit during the original analysis. Each is handled in code
 
 Verified 2026-07-30 with `From = 2026-01-01`.
 
-### On the default 7-rep roster — what the page actually shows
+### Dose-response by team — the most useful output of the page
 
-| Figure | Value |
-|---|---|
-| Contacts with ≥1 outbound touch | 2,094 |
-| 3+ touches → replied or met | **52.6%** |
-| 1–2 touches → replied or met | **34.1%** |
-| Gap | +18.6 pts |
-| Contacts at 3+ touches | 59.8% |
-| Outbound per rep, week of Jul 20 | 27.3 |
-| Outbound per rep, trailing 9 weeks | 27.3–48.5 |
+Counted per team, so a contact worked by two teams appears under both with only that team's touches; the rows don't sum to the combined figure.
 
-The ≥3 benchmark still validates clearly on the correct denominator, though the gap narrows from +24.5 to +18.6 points. That's expected: contacts touched by both a roster rep and a non-rep now count only the roster touches, so some engaged contacts move from the 3+ bucket to the 1–2 bucket while keeping the intent they earned.
+| Team | Contacts | 3+ touches engage | 1–2 touches engage | Difference |
+|---|---|---|---|---|
+| **Reps** | 778 | 74.1% | 40.6% | **+33.5 pts** |
+| ABM | 908 | 11.9% | 15.7% | **−3.7 pts** |
+| CS | 741 | 93.1% | 56.3% | +36.8 pts |
+| *All combined* | *2,215* | *55.6%* | *35.0%* | *+20.6 pts* |
+
+Two things to take from this:
+
+- **The ≥3 benchmark holds much harder for new-business reps than any blended number suggests** — +33.5 points, against +20.6 blended. Reporting the blend understates the case for touch depth.
+- **For the ABM programme the benchmark inverts.** More touches produced slightly *fewer* responses. Whatever the third touch is worth on a worked account, it is worth nothing on a cold imported list — which is the strongest single piece of evidence that the Feb–Apr volume wasn't capacity.
+
+Latest complete week (Jul 20 2026) outbound per rep: Reps 22.0, ABM 37.0, CS 30.3.
 
 ### On all 41 touch owners — the original spec's basis, kept as a regression check
 

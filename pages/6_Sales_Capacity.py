@@ -90,43 +90,69 @@ GCP_PROJECT          = "bi-ntop"
 # Validated empirically — see the dose-response callout in section 1.
 HIGH_EFFORT_THRESHOLD = 3
 
-# The people actually doing outbound, and therefore the denominator for every
-# "per rep" figure on this page.
+# Who is doing the outreach, split by the motion they're running. Every "per rep"
+# figure divides within these teams, and the weekly trend charts them separately —
+# blending them hides one team's volume behind another's, which is exactly how a
+# single high-volume ABM programme came to look like team-wide capacity.
 #
-# This has to be an explicit list. Salesforce `user.title` is blank for five of
-# the seven, there is no user_role table in the warehouse, and everyone is on an
-# @ntop.com address with a Standard licence — so there is no field that separates
-# the outbound team from the CEO, the General Counsel or a Solutions Engineer who
-# happens to own a couple of logged emails. Counting all task/event owners
-# instead (the original spec's `COUNT(DISTINCT owner_id)`) pulled in 41 people
-# and understated outbound per rep by roughly 3x.
+# This has to be an explicit mapping. Salesforce `user.title` is blank for most of
+# these people, there is no user_role table in the warehouse, and everyone is on an
+# @ntop.com Standard licence — so no field separates a rep from the CEO, the
+# General Counsel, or a Solutions Engineer who owns a couple of logged emails.
+# Counting all task/event owners instead (the original spec's
+# `COUNT(DISTINCT owner_id)`) pulled in 41 people and understated outbound per rep
+# by roughly 3x.
 #
-# Overridable per-session from the sidebar. Anyone outside the roster doing real
-# volume is flagged below rather than silently ignored, so this list failing to
-# keep up with hiring is visible instead of quiet.
-DEFAULT_REP_ROSTER = [
-    "Laurel Berger",
-    "Evan Boyer",
-    "Taha Benhaddou",
-    "Cheyenne Cullen",
-    "Albright Tshisekedi",
-    "Addison Berenzweig",
-    "James Gibbons",
-]
+# Overridable per-session from the sidebar.
+TEAMS = {
+    "Reps": ["Addison Berenzweig", "Evan Boyer", "James Gibbons"],
+    "ABM":  ["Laurel Berger"],
+    "CS":   ["Taha Benhaddou", "Cheyenne Cullen", "Albright Tshisekedi",
+             "Neil Brayman"],
+}
+TEAM_ORDER = ["Reps", "ABM", "CS"]
 
-# Outbound touches in-window that make someone worth a second look if they
-# aren't in the selected roster.
+TEAM_COLORS = {
+    "Reps": "#0047FF",       # new business — the capacity question
+    "ABM":  "#EB6834",       # high-volume programme, kept visually distinct
+    "CS":   _C["green"],     # existing customers
+}
+
+TEAM_BLURB = {
+    "Reps": "New-business outbound. This is the team the capacity question is "
+            "actually about.",
+    "ABM":  "High-volume account-based programme. Ran hard Feb–Apr 2026 against "
+            "largely freshly-imported contacts; read its volume separately from "
+            "rep effort.",
+    "CS":   "Customer success outreach to existing customers. High reply rates "
+            "here are expected and are not a new-business signal.",
+}
+
+# Outbound touches in-window that make someone worth a second look if they aren't
+# in the selected teams.
 ROSTER_REVIEW_THRESHOLD = 250
 
-# People who clear that threshold but are deliberately off the roster — their day
-# job is something other than outbound. Listed so the staleness check stays quiet
-# about known cases and only speaks up for someone genuinely new; without this it
-# would flag the same four every week and get ignored.
-KNOWN_NON_REPS = {
-    "Neil Brayman":        "Customer Success Manager",
-    "Andrew Hanno":        "VP of Marketing, since departed",
-    "Joel Bejar":          "VP of Sales",
-    "Hemant Bhoosnurmath": "Solutions Engineer",
+# People with real outbound volume who are deliberately counted nowhere. Listed so
+# the staleness check stays quiet about known cases and only speaks up for someone
+# genuinely new; without this it would fire every week and get ignored.
+EXCLUDED_OWNERS = {
+    "Andrew Hanno":        "VP of Marketing, since departed — activity isn't "
+                           "comparable to a carrying rep's",
+    "Joel Bejar":          "VP of Sales — relationship support only, not "
+                           "carrying a patch",
+    "Hemant Bhoosnurmath": "Solutions Engineer — technical support on live deals",
+}
+
+# Outbound channels. The values are the touch_type codes the SQL emits; the sidebar
+# filter selects which of them count as an outbound touch.
+#
+# LinkedIn and Call volumes are genuinely small (209 and 86 in 2026 against 13,693
+# emails), so treat their trend lines as directional at best.
+CHANNELS = {
+    "Email":    "email_out",
+    "LinkedIn": "linkedin",
+    "Call":     "call",
+    "Other":    "other_channel",
 }
 
 # Outreach activity only starts being reliably logged in 2026.
@@ -277,12 +303,30 @@ QUADRANT_CELLS = [
 # page (not in an expander) so nobody has to read the code to know what was
 # decided. Add to this list whenever a definition changes.
 METHODOLOGY_NOTES = [
-    ("\"Per rep\" means the outbound team, not everyone in Salesforce",
-     "Every per-rep figure divides by the reps selected in the sidebar, which "
-     "defaults to the seven people actually doing outbound. Counting every "
-     "task and meeting owner instead would pull in 41 people — the CEO, "
-     "finance, legal, solutions engineers and anyone who merely sat in on a "
+    ("Outbound is split into three teams, never blended",
+     "Reps run new business (Addison, Evan, James). ABM is the high-volume "
+     "account programme (Laurel). CS works existing customers (Taha, Cheyenne, "
+     "Albright, Neil). Every per-rep figure divides within a team and the trend "
+     "charts them separately — a single blended average is what let one "
+     "programme's volume read as team-wide capacity."),
+    ("Volume is not capacity unless it converts",
+     "In 2026 the ABM programme logged 2,859 outbound touches and produced 3 "
+     "meetings — about 1 per thousand, against 36–248 for everyone else. The "
+     "Feb–Apr spike in touch volume was largely this programme, so read the "
+     "per-team lines before concluding effort has fallen since April."),
+    ("Some owners are counted nowhere",
+     "The VP of Marketing (since departed) and the VP of Sales are excluded: one "
+     "isn't comparable to a carrying rep, the other only supports relationships. "
+     "A Solutions Engineer is excluded as technical support on live deals. Their "
+     "volume is shown as an excluded-by-design line, not hidden."),
+    ("\"Per rep\" means these teams, not everyone in Salesforce",
+     "Counting every task and meeting owner instead would pull in 41 people — the "
+     "CEO, finance, legal, solutions engineers and anyone who merely sat in on a "
      "meeting — and understate outbound per rep by roughly 3x."),
+    ("Inbound calls and LinkedIn profile views are not outbound touches",
+     "Salesforce logs both alongside genuine outreach. Counting an inbound call "
+     "as a rep touch flatters effort, and looking at someone's LinkedIn profile "
+     "isn't contact with them. Both are excluded (61 tasks in 2026)."),
     ("What counts as a touch",
      "Only Outreach-logged activity: outbound emails, calls, and LinkedIn/other "
      "messages. Inbound email replies and non-recurring meetings count as intent "
@@ -313,6 +357,10 @@ METHODOLOGY_NOTES = [
     ("Grain",
      "Touch metrics are weekly. Speed to lead and qualified opportunities are "
      "monthly — the counts are small enough that weekly is noise."),
+    ("Channel volumes are lopsided",
+     "Of 2026 outbound, email is 13,693 touches, LinkedIn 209 and calls 86. The "
+     "channel filter works, but a LinkedIn or call trend line is directional at "
+     "best — don't read a slope into a handful of touches a week."),
 ]
 
 
@@ -571,9 +619,19 @@ def _dates(start: date, end: date) -> list:
     ]
 
 
-def _dates_reps(start: date, end: date, reps: tuple[str, ...]) -> list:
+def _dates_reps(start: date, end: date, reps: tuple[str, ...],
+                channels: tuple[str, ...] = ()) -> list:
+    """
+    Params for the touch queries. Team membership goes in as arrays rather than
+    interpolated SQL — rep names originate from warehouse data via the picker, so
+    they never get concatenated into query text.
+    """
     return _dates(start, end) + [
         bigquery.ArrayQueryParameter("reps", "STRING", list(reps)),
+        bigquery.ArrayQueryParameter("channels", "STRING", list(channels)),
+        bigquery.ArrayQueryParameter("t_reps", "STRING", TEAMS["Reps"]),
+        bigquery.ArrayQueryParameter("t_abm", "STRING", TEAMS["ABM"]),
+        bigquery.ArrayQueryParameter("t_cs", "STRING", TEAMS["CS"]),
     ]
 
 
@@ -591,12 +649,17 @@ ops_users AS (
 )
 """
 
-# The selected outbound roster, resolved from display names. This is an
-# allowlist, so it also subsumes the ops/system-account exclusion above —
-# a service account can never be on the roster.
+# The selected people, resolved from display names and tagged with their team.
+# This is an allowlist, so it also subsumes the ops/system-account exclusion
+# above — a service account can never be on it.
 _SEL_USERS = """
 sel_users AS (
-  SELECT id, name FROM `bi-ntop.salesforce.user`
+  SELECT id, name,
+    CASE WHEN name IN UNNEST(@t_reps) THEN 'Reps'
+         WHEN name IN UNNEST(@t_abm)  THEN 'ABM'
+         WHEN name IN UNNEST(@t_cs)   THEN 'CS'
+         ELSE 'Unassigned' END AS team
+  FROM `bi-ntop.salesforce.user`
   WHERE _fivetran_deleted = FALSE
     AND name IN UNNEST(@reps)
 )
@@ -604,32 +667,47 @@ sel_users AS (
 
 # Touch bucketing, matched on task subject.
 #
-# TRAP 1: only these five subject patterns are touches. `Sent %`, `Opened %`
-# and `Clicked %` tasks are bulk-newsletter tracking logs attributed to whoever
-# owns the record — including them inflates touch counts ~5x. They fall through
-# this CASE to NULL and are dropped by `WHERE touch_type IS NOT NULL`.
+# TRAP 1: only these subject patterns are touches. `Sent %`, `Opened %` and
+# `Clicked %` tasks are bulk-newsletter tracking logs attributed to whoever owns
+# the record — including them inflates touch counts ~5x. They fall through this
+# CASE to NULL and are dropped by `WHERE touch_type IS NOT NULL`.
 #
 # TRAP 4: `Submitted Form%` tasks are duplicate mirrors of HubSpot form
 # submissions and are likewise not matched here.
 #
-# The call bucket is matched case-insensitively — direction markers appear as
-# both [outbound] and [Outbound] in the wild.
+# TRAP 8: `[Outreach] [Call]` carries a direction marker that appears in mixed
+# case — [outbound] and [Outbound] — but ALSO as [inbound]. Matching the bucket
+# loosely (the original spec's `LIKE '%[outreach] [call]%'`) counted 27 inbound
+# calls in 2026 as outbound touches. Direction is now matched explicitly and
+# inbound calls get their own non-outbound bucket.
+#
+# TRAP 9: `LinkedIn: View a Profile` is a passive research action, not outreach
+# to the contact. It sat inside the old catch-all `[Outreach] [Other]%` bucket
+# and counted as a touch — 34 in 2026. Now bucketed separately and excluded.
+# Its branch must stay ABOVE the generic Other branch or it gets swallowed.
 _TOUCH_CASE = """
-CASE WHEN t.subject LIKE '[Outreach] [Email] [Out]%'  THEN 'email_out'
-     WHEN t.subject LIKE '[Outreach] [Email] [In]%'   THEN 'email_in'
-     WHEN LOWER(t.subject) LIKE '%[outreach] [call]%' THEN 'call'
-     WHEN t.subject LIKE '[Outreach] [Other]%'        THEN 'other_channel'
-     WHEN t.subject LIKE 'Catalyst Note%'             THEN 'catalyst'
+CASE WHEN t.subject LIKE '[Outreach] [Email] [Out]%' THEN 'email_out'
+     WHEN t.subject LIKE '[Outreach] [Email] [In]%'  THEN 'email_in'
+     WHEN LOWER(t.subject) LIKE '[outreach] [call] [outbound]%' THEN 'call'
+     WHEN LOWER(t.subject) LIKE '[outreach] [call] [inbound]%'  THEN 'call_in'
+     WHEN t.subject LIKE '[Outreach] [Other] LinkedIn: View a Profile%'
+                                                     THEN 'li_profile_view'
+     WHEN t.subject LIKE '[Outreach] [Other] LinkedIn:%' THEN 'linkedin'
+     WHEN t.subject LIKE '[Outreach] [Other]%'       THEN 'other_channel'
+     WHEN t.subject LIKE 'Catalyst Note%'            THEN 'catalyst'
 END
 """
 
-_OUTBOUND_TYPES = "('email_out','call','other_channel')"
+# Which touch types count as outbound is driven by the channel filter.
+_OUTBOUND_TYPES = "UNNEST(@channels)"
 
 # Outbound-only subject match, for the queries that don't need bucket labels.
+# Mirrors _TOUCH_CASE exactly, including traps 8 and 9.
 _OUTBOUND_SUBJECT_MATCH = """
 (subject LIKE '[Outreach] [Email] [Out]%'
- OR LOWER(subject) LIKE '%[outreach] [call]%'
- OR subject LIKE '[Outreach] [Other]%')
+ OR LOWER(subject) LIKE '[outreach] [call] [outbound]%'
+ OR (subject LIKE '[Outreach] [Other]%'
+     AND subject NOT LIKE '[Outreach] [Other] LinkedIn: View a Profile%'))
 """
 
 # TRAP 2: `salesforce.event` holds future-dated recurring instances out to 2028.
@@ -640,31 +718,39 @@ _EVENT_END_BOUND = "LEAST(@end_date, CURRENT_DATE())"
 
 # ── Data loaders ──────────────────────────────────────────────────────────────
 @st.cache_data(ttl=3600)
-def load_weekly_facts(start: date, end: date, reps: tuple[str, ...]) -> pd.DataFrame:
-    """Weekly rep fact table — the primary query for this tab."""
+def load_weekly_facts(start: date, end: date, reps: tuple[str, ...],
+                      channels: tuple[str, ...], by_team: bool) -> pd.DataFrame:
+    """
+    Weekly fact table — the primary query for this tab.
+
+    `by_team=True` returns one row per week per team; False aggregates across all
+    selected people. The per-team form is what the trend charts use.
+    """
+    dim = "team, " if by_team else ""
+    grp = "wk, team" if by_team else "wk"
     query = f"""
     WITH {_SEL_USERS},
     touches AS (
       SELECT DATE_TRUNC(DATE(t.created_date), WEEK(MONDAY)) AS wk,
-             t.owner_id, t.who_id,
+             s.team, t.owner_id, t.who_id,
              {_TOUCH_CASE} AS touch_type
       FROM `bi-ntop.salesforce.task` t
+      JOIN sel_users s ON s.id = t.owner_id
       WHERE t._fivetran_deleted = FALSE          -- TRAP 7
         AND DATE(t.created_date) BETWEEN @start_date AND @end_date
         AND t.who_id IS NOT NULL
-        AND t.owner_id IN (SELECT id FROM sel_users)
       UNION ALL
       SELECT DATE_TRUNC(DATE(e.start_date_time), WEEK(MONDAY)),
-             e.owner_id, e.who_id,
+             s.team, e.owner_id, e.who_id,
              IF(e.is_child, 'meeting_recurring', 'meeting')
       FROM `bi-ntop.salesforce.event` e
+      JOIN sel_users s ON s.id = e.owner_id
       WHERE e._fivetran_deleted = FALSE          -- TRAP 7
         AND DATE(e.start_date_time)
             BETWEEN @start_date AND {_EVENT_END_BOUND}   -- TRAP 2
         AND e.who_id IS NOT NULL
-        AND e.owner_id IN (SELECT id FROM sel_users)
     )
-    SELECT wk,
+    SELECT wk, {dim}
       COUNT(DISTINCT owner_id) AS active_reps,
       COUNT(DISTINCT who_id)   AS contacts_touched,
       COUNTIF(touch_type IN {_OUTBOUND_TYPES}) AS outbound,
@@ -675,15 +761,15 @@ def load_weekly_facts(start: date, end: date, reps: tuple[str, ...]) -> pd.DataF
             / NULLIF(COUNT(DISTINCT owner_id),0), 1) AS outbound_per_rep
     FROM touches
     WHERE touch_type IS NOT NULL
-    GROUP BY wk
-    ORDER BY wk
+    GROUP BY {grp}
+    ORDER BY {grp}
     """
-    return _run(query, _dates_reps(start, end, reps))
+    return _run(query, _dates_reps(start, end, reps, channels))
 
 
 @st.cache_data(ttl=3600)
-def load_touches_per_contact(start: date, end: date, reps: tuple[str, ...]
-                             ) -> pd.DataFrame:
+def load_touches_per_contact(start: date, end: date, reps: tuple[str, ...],
+                             channels: tuple[str, ...]) -> pd.DataFrame:
     """Distribution of outbound touches per contact, bucketed 1 / 2 / 3+."""
     query = f"""
     WITH {_SEL_USERS},
@@ -694,7 +780,7 @@ def load_touches_per_contact(start: date, end: date, reps: tuple[str, ...]
         AND DATE(t.created_date) BETWEEN @start_date AND @end_date
         AND t.who_id IS NOT NULL
         AND t.owner_id IN (SELECT id FROM sel_users)
-        AND {_OUTBOUND_SUBJECT_MATCH.replace('subject', 't.subject')}
+        AND {_TOUCH_CASE} IN {_OUTBOUND_TYPES}
       GROUP BY 1
     )
     SELECT
@@ -707,54 +793,68 @@ def load_touches_per_contact(start: date, end: date, reps: tuple[str, ...]
     GROUP BY 1
     ORDER BY 1
     """
-    return _run(query, _dates_reps(start, end, reps))
+    return _run(query, _dates_reps(start, end, reps, channels))
 
 
 @st.cache_data(ttl=3600)
-def load_quadrant(start: date, end: date, reps: tuple[str, ...]) -> pd.DataFrame:
-    """Effort x intent quadrant, one row per contact cohort."""
+def load_quadrant(start: date, end: date, reps: tuple[str, ...],
+                  channels: tuple[str, ...], by_team: bool = False
+                  ) -> pd.DataFrame:
+    """
+    Effort x intent quadrant, one row per contact cohort.
+
+    Effort respects the channel filter; intent does not. A reply or a meeting is
+    an outcome, not a channel — narrowing to LinkedIn should change how much
+    effort we count, not whether the contact responded.
+
+    With `by_team=True`, effort and intent are counted per (team, contact): a
+    contact worked by two teams appears under both with only that team's touches.
+    That's the right scope for comparing motions, and it's why the per-team rows
+    don't sum to the combined figure.
+    """
+    dim  = "team, " if by_team else ""
+    pgrp = "team, who_id" if by_team else "who_id"
+    ggrp = "1,2,3" if by_team else "1,2"
     query = f"""
     WITH {_SEL_USERS},
     u AS (
-      SELECT t.who_id,
-        CASE WHEN t.subject LIKE '[Outreach] [Email] [Out]%'  THEN 'out'
-             WHEN LOWER(t.subject) LIKE '%[outreach] [call]%' THEN 'out'
-             WHEN t.subject LIKE '[Outreach] [Other]%'        THEN 'out'
-             WHEN t.subject LIKE '[Outreach] [Email] [In]%'   THEN 'reply'
+      SELECT s.team, t.who_id,
+        CASE WHEN {_TOUCH_CASE} IN {_OUTBOUND_TYPES}       THEN 'out'
+             WHEN t.subject LIKE '[Outreach] [Email] [In]%' THEN 'reply'
         END AS k
       FROM `bi-ntop.salesforce.task` t
+      JOIN sel_users s ON s.id = t.owner_id
       WHERE t._fivetran_deleted = FALSE
         AND DATE(t.created_date) BETWEEN @start_date AND @end_date
         AND t.who_id IS NOT NULL
-        AND t.owner_id IN (SELECT id FROM sel_users)
       UNION ALL
       -- is_child = FALSE: recurring instances are excluded from intent
-      SELECT e.who_id, 'meeting'
+      SELECT s.team, e.who_id, 'meeting'
       FROM `bi-ntop.salesforce.event` e
+      JOIN sel_users s ON s.id = e.owner_id
       WHERE e._fivetran_deleted = FALSE
         AND e.is_child = FALSE
         AND DATE(e.start_date_time)
             BETWEEN @start_date AND {_EVENT_END_BOUND}   -- TRAP 2
         AND e.who_id IS NOT NULL
-        AND e.owner_id IN (SELECT id FROM sel_users)
     ),
     per AS (
-      SELECT who_id,
+      SELECT {pgrp},
         COUNTIF(k = 'out')     AS outbound,
         COUNTIF(k = 'reply')   AS replies,
         COUNTIF(k = 'meeting') AS meetings
-      FROM u WHERE k IS NOT NULL GROUP BY 1
+      FROM u WHERE k IS NOT NULL GROUP BY {pgrp}
     )
-    SELECT
+    SELECT {dim}
       IF(outbound >= {HIGH_EFFORT_THRESHOLD}, 'high_effort', 'low_effort') AS effort,
       IF(replies > 0 OR meetings > 0, 'high_intent', 'no_intent') AS intent,
       COUNT(*) AS contacts,
       ROUND(AVG(outbound),1) AS avg_outbound
     FROM per
     WHERE outbound > 0
-    GROUP BY 1,2
+    GROUP BY {ggrp}
     """
-    return _run(query, _dates_reps(start, end, reps))
+    return _run(query, _dates_reps(start, end, reps, channels))
 
 
 @st.cache_data(ttl=3600)
@@ -916,8 +1016,9 @@ def load_rep_options(start: date, end: date) -> pd.DataFrame:
 
 
 @st.cache_data(ttl=3600)
-def load_per_rep(start: date, end: date, reps: tuple[str, ...]) -> pd.DataFrame:
-    """Per-rep drill-down over the selected window."""
+def load_per_rep(start: date, end: date, reps: tuple[str, ...],
+                 channels: tuple[str, ...]) -> pd.DataFrame:
+    """Per-person drill-down over the selected window."""
     query = f"""
     WITH {_SEL_USERS},
     touches AS (
@@ -959,20 +1060,23 @@ def load_per_rep(start: date, end: date, reps: tuple[str, ...]) -> pd.DataFrame:
       FROM per_rep_contact GROUP BY 1
     )
     SELECT
-      COALESCE(us.name, a.owner_id) AS rep,
+      COALESCE(s.name, a.owner_id) AS rep,
+      s.team,
       a.outbound, a.contacts_touched, a.replies, a.meetings, a.catalyst_notes,
       b.contacts_at_benchmark,
       ROUND(100*b.contacts_at_benchmark
             / NULLIF(b.contacts_with_outbound,0), 0) AS pct_at_benchmark,
       ROUND(a.outbound / NULLIF(b.contacts_with_outbound,0), 1)
-            AS avg_outbound_per_contact
+            AS avg_outbound_per_contact,
+      -- the yield column: meetings booked per 1,000 outbound touches. This is
+      -- what separated the ABM programme from rep work by two orders of magnitude
+      ROUND(1000 * a.meetings / NULLIF(a.outbound,0), 1) AS meetings_per_1k
     FROM agg a
     LEFT JOIN bench b ON b.owner_id = a.owner_id
-    LEFT JOIN `bi-ntop.salesforce.user` us
-      ON us.id = a.owner_id AND us._fivetran_deleted = FALSE
+    LEFT JOIN sel_users s ON s.id = a.owner_id
     ORDER BY a.outbound DESC
     """
-    return _run(query, _dates_reps(start, end, reps))
+    return _run(query, _dates_reps(start, end, reps, channels))
 
 
 # ── Chart helpers ─────────────────────────────────────────────────────────────
@@ -1043,30 +1147,70 @@ with st.sidebar:
 
     st.divider()
 
-    # Rep picker. Options are everyone who owns a touch in the window, ordered
-    # by outbound volume, so the people who matter are at the top of the list.
+    # Team layer. Outbound splits into three motions that mean different things;
+    # averaging them together is how one programme's volume masked the rest.
+    selected_teams = st.multiselect(
+        "Teams",
+        options=TEAM_ORDER,
+        default=TEAM_ORDER,
+        help=(
+            "Reps run new business, ABM runs the high-volume account programme, "
+            "CS works existing customers. The weekly trend charts them separately "
+            "and every 'per rep' figure divides within a team."
+        ),
+    )
+
+    # Rep picker, scoped to the chosen teams. Options are everyone who owns a
+    # touch in the window, ordered by outbound volume, so anyone unassigned who is
+    # doing real work is near the top and easy to spot.
     rep_opts_df = load_rep_options(start_date, end_date)
-    all_reps = rep_opts_df["rep"].tolist()
-    default_reps = [r for r in DEFAULT_REP_ROSTER if r in all_reps]
+    seen = rep_opts_df["rep"].tolist()
+
+    team_members = [
+        n for t in selected_teams for n in TEAMS[t] if n in seen
+    ]
+    other_active = [
+        n for n in seen
+        if n not in {m for ms in TEAMS.values() for m in ms}
+        and n not in EXCLUDED_OWNERS
+    ]
 
     selected_reps = st.multiselect(
-        "Reps",
-        options=all_reps,
-        default=default_reps or all_reps,
+        "People",
+        options=team_members + other_active,
+        default=team_members,
         help=(
-            "Drives every touch metric on this page and the denominator for all "
-            "'per rep' figures. Defaults to the outbound team. Speed to lead and "
-            "qualified opportunities are not filtered — see their panels."
+            "Defaults to everyone on the selected teams. Anyone unassigned who "
+            "owns touches in this window is listed after them so they can be "
+            "pulled in ad hoc."
+        ),
+    )
+
+    st.divider()
+
+    selected_channels = st.multiselect(
+        "Touch channels",
+        options=list(CHANNELS),
+        default=list(CHANNELS),
+        help=(
+            "Which channels count as an outbound touch. Replies and meetings are "
+            "outcomes rather than channels, so they are never filtered here — "
+            "narrowing to LinkedIn changes how much effort is counted, not "
+            "whether the contact responded."
         ),
     )
 
     st.caption(
-        f"{len(selected_reps)} of {len(all_reps)} touch owners selected. "
-        f"Outreach activity is only reliably logged from January 2026 onward. "
-        f"Data is cached for one hour."
+        f"{len(selected_reps)} of {len(seen)} touch owners selected across "
+        f"{len(selected_teams)} team(s). Outreach activity is only reliably "
+        f"logged from January 2026 onward. Data is cached for one hour."
     )
 
-REPS = tuple(selected_reps)
+REPS      = tuple(selected_reps)
+CHANS     = tuple(CHANNELS[c] for c in selected_channels)
+TEAMS_ON  = [t for t in TEAM_ORDER if t in selected_teams]
+# Which team each selected person belongs to, for labelling in Python
+REP_TEAM  = {n: t for t, ms in TEAMS.items() for n in ms}
 
 
 # ── Methodology notes ─────────────────────────────────────────────────────────
@@ -1088,7 +1232,7 @@ _outside = rep_opts_df[
     (~rep_opts_df["rep"].isin(selected_reps))
     & (rep_opts_df["outbound"] >= ROSTER_REVIEW_THRESHOLD)
 ]
-_unrecognised = _outside[~_outside["rep"].isin(KNOWN_NON_REPS)]
+_unrecognised = _outside[~_outside["rep"].isin(EXCLUDED_OWNERS)]
 if not _unrecognised.empty:
     _who = ", ".join(
         f"{r.rep} ({int(r.outbound):,} outbound)"
@@ -1097,31 +1241,78 @@ if not _unrecognised.empty:
     st.warning(
         f"**{len(_unrecognised)} "
         f"{'person' if len(_unrecognised) == 1 else 'people'} outside the "
-        f"selected reps logged {ROSTER_REVIEW_THRESHOLD}+ outbound touches in "
-        f"this window:** {_who}. If they belong on the outbound team, add them "
-        f"in the sidebar — their volume is excluded from every figure below. "
-        f"If they don't, add them to `KNOWN_NON_REPS` in the page source to stop "
-        f"this notice."
+        f"selected teams logged {ROSTER_REVIEW_THRESHOLD}+ outbound touches in "
+        f"this window:** {_who}. If they belong to a team, add them to `TEAMS` in "
+        f"the page source; if they shouldn't count at all, add them to "
+        f"`EXCLUDED_OWNERS`. Until then their volume is excluded from every "
+        f"figure below."
     )
 
-# Known non-reps with real volume, surfaced quietly rather than hidden — the
-# effort is real work, it just isn't outbound-team capacity.
-_known_excluded = _outside[_outside["rep"].isin(KNOWN_NON_REPS)]
+# People with real volume who are deliberately counted nowhere. Surfaced quietly
+# rather than hidden — the effort is real work, it just isn't team capacity.
+_known_excluded = _outside[_outside["rep"].isin(EXCLUDED_OWNERS)]
 if not _known_excluded.empty:
     _known_txt = " · ".join(
-        f"{r.rep} ({KNOWN_NON_REPS[r.rep]}, {int(r.outbound):,})"
+        f"{r.rep} — {EXCLUDED_OWNERS[r.rep]} ({int(r.outbound):,} outbound)"
         for r in _known_excluded.itertuples()
     )
-    st.caption(
-        f":gray[Also logging outbound but excluded as non-reps: {_known_txt}. "
-        f"Counted nowhere on this page.]"
-    )
+    st.caption(f":gray[Excluded by design: {_known_txt}.]")
 
 if not REPS:
     st.info(
-        "No reps selected. Pick at least one in the sidebar to see the touch "
-        "metrics. Speed to lead and qualified opportunities are unaffected."
+        "Nobody selected. Pick at least one team or person in the sidebar to see "
+        "the touch metrics. Speed to lead and qualified opportunities are "
+        "unaffected."
     )
+elif not CHANS:
+    st.info(
+        "No touch channels selected. Pick at least one in the sidebar — with none "
+        "selected there is nothing to count as an outbound touch."
+    )
+
+ACTIVE = bool(REPS) and bool(CHANS)
+
+# Team composition, so the reader knows who is in each line on the charts below
+if ACTIVE:
+    _comp = " · ".join(
+        f"**{t}** {', '.join(n for n in TEAMS[t] if n in REPS)}"
+        for t in TEAMS_ON if any(n in REPS for n in TEAMS[t])
+    )
+    _extra = [n for n in REPS if n not in REP_TEAM]
+    if _extra:
+        _comp += f" · **Unassigned** {', '.join(_extra)}"
+    st.caption(_comp)
+    if len(selected_channels) < len(CHANNELS):
+        st.caption(
+            f":gray[Outbound counted from **{', '.join(selected_channels)}** only. "
+            f"Replies and meetings are unfiltered.]"
+        )
+
+
+# ── Team-series chart helper ──────────────────────────────────────────────────
+def _team_lines(df: pd.DataFrame, col: str, title: str, ylab: str,
+                fmt: str = ",d", height: int = 380) -> go.Figure:
+    """One line per team on a single y-axis. Never a second axis — two scales on
+    one plot make the alignment arbitrary and invent a relationship."""
+    fig = go.Figure()
+    for team in TEAMS_ON:
+        t_df = df[df["team"] == team]
+        if t_df.empty:
+            continue
+        hov = "%{y:.1f}" if fmt == ".1f" else "%{y:,d}"
+        fig.add_trace(go.Scatter(
+            x=t_df["wk"], y=t_df[col], name=team,
+            mode="lines+markers",
+            line=dict(color=TEAM_COLORS[team], width=2.5),
+            marker=dict(size=5),
+            hovertemplate=f"%{{x|%b %d}}: {hov}<extra>{team}</extra>",
+        ))
+    _base_layout(fig, title, "Weekly", height=height)
+    fig.update_layout(yaxis=dict(
+        title=ylab, showgrid=True, gridcolor="#F0F0F0",
+        tickformat=fmt, rangemode="tozero",
+    ))
+    return fig
 
 
 # ── 1. Headline — the dose-response ───────────────────────────────────────────
@@ -1133,7 +1324,10 @@ st.caption(
 )
 
 with st.spinner("Loading touch data…"):
-    quad_df = load_quadrant(start_date, end_date, REPS) if REPS else pd.DataFrame()
+    quad_df = (
+        load_quadrant(start_date, end_date, REPS, CHANS)
+        if ACTIVE else pd.DataFrame()
+    )
 
 if quad_df.empty:
     st.info("No touch data in the selected range.")
@@ -1180,11 +1374,49 @@ st.markdown(
     unsafe_allow_html=True,
 )
 st.caption(
-    f"Across {total_contacts:,} contacts who received at least one outbound "
-    f"touch from the {len(REPS)} selected reps in this window. A contact is "
-    f"counted as engaged if they replied by email or took a non-recurring "
-    f"meeting."
+    f"All selected teams combined: {total_contacts:,} contacts who received at "
+    f"least one outbound touch in this window. A contact counts as engaged if "
+    f"they replied by email or took a non-recurring meeting."
 )
+
+# The combined figure blends motions that convert very differently, which is the
+# same mistake as a single blended per-rep average. Break it out by team.
+if ACTIVE and len(TEAMS_ON) > 1:
+    with st.spinner("Loading per-team dose-response…"):
+        qt_df = load_quadrant(start_date, end_date, REPS, CHANS, True)
+
+    if not qt_df.empty:
+        rows = []
+        for team in TEAMS_ON:
+            t = qt_df[qt_df["team"] == team]
+            if t.empty:
+                continue
+            g = {(r.effort, r.intent): int(r.contacts) for r in t.itertuples()}
+            hi = g.get(("high_effort", "high_intent"), 0)
+            hn = g.get(("high_effort", "no_intent"), 0)
+            lo = g.get(("low_effort", "high_intent"), 0)
+            ln_ = g.get(("low_effort", "no_intent"), 0)
+            if not (hi + hn) or not (lo + ln_):
+                continue
+            hr, lr = 100 * hi / (hi + hn), 100 * lo / (lo + ln_)
+            rows.append({
+                "Team": team,
+                "Contacts": hi + hn + lo + ln_,
+                f"{HIGH_EFFORT_THRESHOLD}+ touches engage": f"{hr:.1f}%",
+                "1–2 touches engage": f"{lr:.1f}%",
+                # sign-aware: ABM's dose-response is genuinely negative
+                "Difference": f"{hr - lr:+.1f} pts",
+            })
+        if rows:
+            st.dataframe(pd.DataFrame(rows), use_container_width=True,
+                         hide_index=True)
+            st.caption(
+                "Counted per team, so a contact worked by two teams appears "
+                "under both with only that team's touches — which is why these "
+                "don't sum to the combined figure above. The threshold holds far "
+                "harder for new-business reps than the blended number suggests; "
+                "high-volume ABM outreach dilutes it."
+            )
 
 
 # ── 2. Weekly trend ───────────────────────────────────────────────────────────
@@ -1194,7 +1426,8 @@ st.caption(METRIC_COPY["outbound_per_rep"]["why"])
 
 with st.spinner("Loading weekly trend…"):
     wk_df = (
-        load_weekly_facts(start_date, end_date, REPS) if REPS else pd.DataFrame()
+        load_weekly_facts(start_date, end_date, REPS, CHANS, True)
+        if ACTIVE else pd.DataFrame()
     )
 
 wk_df, _has_current_week = _prep_weeks(wk_df, start_date, end_date, today)
@@ -1206,87 +1439,108 @@ if wk_df.empty:
         "isn't real — widen the range to see the weekly trend."
     )
 else:
-    complete = wk_df.iloc[:-1] if _has_current_week else wk_df
-    latest = complete.iloc[-1] if not complete.empty else wk_df.iloc[-1]
+    # Drop the in-progress week BY WEEK, not by row — there is one row per week
+    # per team now, so slicing off a single row would leave the partial week in
+    # and the headline tiles would report it as the latest complete week.
+    _wkd = pd.to_datetime(wk_df["wk"]).dt.date
+    _this_monday = today - timedelta(days=today.weekday())
+    _is_complete = (
+        _wkd != _this_monday if _has_current_week
+        else pd.Series(True, index=wk_df.index)
+    )
+    _last_wk = (
+        wk_df.loc[_is_complete, "wk"].max() if _is_complete.any()
+        else wk_df["wk"].max()
+    )
+    _latest = wk_df[wk_df["wk"] == _last_wk]
 
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric(
-        "Outbound per rep",
-        f"{latest['outbound_per_rep']:.1f}",
-        help=METRIC_COPY["outbound_per_rep"]["what"],
-    )
-    m2.metric(
-        "Contacts touched",
-        f"{int(latest['contacts_touched']):,}",
-        help=METRIC_COPY["contacts_touched"]["what"],
-    )
-    m3.metric(
-        "Reps logging touches",
-        f"{int(latest['active_reps'])} of {len(REPS)}",
-        help=(
-            "Selected reps who logged at least one touch that week, out of the "
-            "reps chosen in the sidebar. This is the denominator for outbound "
-            "per rep."
-        ),
-    )
-    m4.metric("Meetings booked", f"{int(latest['meetings'])}")
+    # One tile per team. Deliberately not a blended average — a single
+    # "outbound per rep" across teams running different motions is the number
+    # that hid the ABM programme inside team-wide capacity.
+    cols = st.columns(max(len(TEAMS_ON), 1))
+    for col, team in zip(cols, TEAMS_ON):
+        row = _latest[_latest["team"] == team]
+        if row.empty:
+            col.metric(f"{team} — outbound per rep", "—",
+                       help=TEAM_BLURB[team])
+            continue
+        r = row.iloc[0]
+        n_team = len([n for n in TEAMS[team] if n in REPS])
+        col.metric(
+            f"{team} — outbound per rep",
+            f"{r['outbound_per_rep']:.1f}",
+            help=f"{TEAM_BLURB[team]}  ·  {METRIC_COPY['outbound_per_rep']['what']}",
+        )
+        col.caption(
+            f"{int(r['outbound']):,} touches · {int(r['active_reps'])} of "
+            f"{n_team} active · {int(r['contacts_touched']):,} contacts"
+        )
+
     st.caption(
         f"Latest complete week beginning "
-        f"{pd.to_datetime(latest['wk']).strftime('%b %d, %Y')}. "
-        f"Per-rep figures divide by the reps who logged touches that week, not "
-        f"by everyone who owns a record in Salesforce."
+        f"{pd.to_datetime(_last_wk).strftime('%b %d, %Y')}. Each team divides by "
+        f"its own reps who logged touches that week."
     )
 
-    fig1 = go.Figure()
-    fig1.add_trace(go.Bar(
-        x=wk_df["wk"], y=wk_df["outbound"], name="Outbound touches",
-        marker_color=_C["gray_light"],
-        hovertemplate="%{x|%b %d}: %{y:,d} outbound<extra></extra>",
-    ))
-    fig1.add_trace(go.Scatter(
-        x=wk_df["wk"], y=wk_df["outbound_per_rep"], name="Outbound per rep",
-        mode="lines+markers", yaxis="y2",
-        line=dict(color="#0047FF", width=2.5), marker=dict(size=5),
-        hovertemplate="%{x|%b %d}: %{y:.1f} per rep<extra></extra>",
-    ))
-    fig1.add_trace(go.Scatter(
-        x=wk_df["wk"], y=wk_df["active_reps"], name="Reps logging touches",
-        mode="lines", yaxis="y2",
-        line=dict(color=_C["gray_mid"], width=1.5, dash="dot"),
-        hovertemplate="%{x|%b %d}: %{y:,d} reps logged touches<extra></extra>",
-    ))
-    _base_layout(fig1, "Outbound volume and intensity per week", "Weekly")
-    fig1.update_layout(
-        yaxis=dict(title="Outbound touches", showgrid=True, gridcolor="#F0F0F0",
-                   tickformat=",d", rangemode="tozero"),
-        yaxis2=dict(title="Per rep / rep count", overlaying="y", side="right",
-                    showgrid=False, rangemode="tozero"),
+    st.plotly_chart(
+        _team_lines(wk_df, "outbound", "Outbound touches per week, by team",
+                    "Outbound touches"),
+        use_container_width=True,
     )
-    st.plotly_chart(fig1, use_container_width=True)
-
-    st.markdown("**Reach vs engagement**")
-    st.caption(METRIC_COPY["contacts_touched"]["why"])
-
-    fig2 = go.Figure()
-    for col, label, color in [
-        ("contacts_touched", "Contacts touched", "#0047FF"),
-        ("replies", "Email replies", _C["green"]),
-        ("meetings", "Meetings (non-recurring)", _C["orange"]),
-        ("meetings_recurring", "Recurring meeting instances", _C["gray_light"]),
-    ]:
-        fig2.add_trace(go.Scatter(
-            x=wk_df["wk"], y=wk_df[col], name=label,
-            mode="lines+markers", line=dict(color=color, width=2),
-            marker=dict(size=4),
-            hovertemplate=f"%{{x|%b %d}}: %{{y:,d}}<extra>{label}</extra>",
-        ))
-    _base_layout(fig2, "Contacts touched, replies and meetings per week", "Weekly")
-    st.plotly_chart(fig2, use_container_width=True)
+    st.plotly_chart(
+        _team_lines(wk_df, "outbound_per_rep",
+                    "Outbound per rep per week, by team", "Touches per rep",
+                    fmt=".1f"),
+        use_container_width=True,
+    )
+    st.caption(
+        "Volume and intensity are charted separately rather than on two y-axes — "
+        "two scales on one plot make their alignment arbitrary and suggest a "
+        "relationship the data doesn't contain."
+    )
 
     if _has_current_week:
         st.caption(
             "The final week is still in progress and will read low until it closes."
         )
+
+
+# ── 2b. Reach vs engagement ───────────────────────────────────────────────────
+if not wk_df.empty:
+    st.divider()
+    st.subheader("Reach vs engagement")
+    st.caption(METRIC_COPY["contacts_touched"]["why"])
+
+    st.plotly_chart(
+        _team_lines(wk_df, "contacts_touched",
+                    "Distinct contacts touched per week, by team", "Contacts"),
+        use_container_width=True,
+    )
+
+    # Replies and meetings sum cleanly across teams (they're event counts, not
+    # distinct-contact counts), so these are shown for all selected teams at once.
+    _out = wk_df.groupby("wk", as_index=False)[
+        ["replies", "meetings", "meetings_recurring"]
+    ].sum()
+    fig2 = go.Figure()
+    for col, label, color in [
+        ("replies", "Email replies", "#0047FF"),
+        ("meetings", "Meetings (non-recurring)", _C["orange"]),
+        ("meetings_recurring", "Recurring meeting instances", _C["gray_light"]),
+    ]:
+        fig2.add_trace(go.Scatter(
+            x=_out["wk"], y=_out[col], name=label,
+            mode="lines+markers", line=dict(color=color, width=2),
+            marker=dict(size=4),
+            hovertemplate=f"%{{x|%b %d}}: %{{y:,d}}<extra>{label}</extra>",
+        ))
+    _base_layout(fig2, "What came back, all selected teams", "Weekly")
+    st.plotly_chart(fig2, use_container_width=True)
+    st.caption(
+        "Replies and meetings are shown across all selected teams combined, and "
+        "are never filtered by channel — they're outcomes, not channels. Expect "
+        "CS to carry a high reply rate: those are existing customers."
+    )
 
 
 # ── 3. Touches per contact ────────────────────────────────────────────────────
@@ -1296,8 +1550,8 @@ st.caption(METRIC_COPY["touches_per_contact"]["why"])
 
 with st.spinner("Loading touch distribution…"):
     dist_df = (
-        load_touches_per_contact(start_date, end_date, REPS)
-        if REPS else pd.DataFrame()
+        load_touches_per_contact(start_date, end_date, REPS, CHANS)
+        if ACTIVE else pd.DataFrame()
     )
 
 if dist_df.empty:
@@ -1537,7 +1791,10 @@ st.caption(
 )
 
 with st.spinner("Loading per-rep detail…"):
-    rep_df = load_per_rep(start_date, end_date, REPS) if REPS else pd.DataFrame()
+    rep_df = (
+        load_per_rep(start_date, end_date, REPS, CHANS)
+        if ACTIVE else pd.DataFrame()
+    )
 
 if rep_df.empty:
     st.info("No rep activity in the selected range.")
@@ -1545,10 +1802,12 @@ else:
     st.dataframe(
         rep_df.rename(columns={
             "rep": "Rep",
+            "team": "Team",
             "outbound": "Outbound",
             "contacts_touched": "Contacts touched",
             "replies": "Replies",
             "meetings": "Meetings",
+            "meetings_per_1k": "Meetings / 1k outbound",
             "catalyst_notes": "Catalyst notes",
             "contacts_at_benchmark": f"Contacts at {HIGH_EFFORT_THRESHOLD}+",
             "pct_at_benchmark": f"% at {HIGH_EFFORT_THRESHOLD}+",
@@ -1557,9 +1816,15 @@ else:
         use_container_width=True, hide_index=True,
     )
     st.caption(
-        f"Counted per rep, so the {HIGH_EFFORT_THRESHOLD}+ columns mean "
-        f"\"{HIGH_EFFORT_THRESHOLD}+ touches from this rep\". A contact worked "
-        f"by two reps appears under both, which is why these don't sum to the "
+        f"**Meetings / 1k outbound** is the yield column — it is what separates "
+        f"working accounts from running volume, and it spanned two orders of "
+        f"magnitude across this team in 2026. Read it next to Outbound, not "
+        f"instead of it."
+    )
+    st.caption(
+        f"Counted per person, so the {HIGH_EFFORT_THRESHOLD}+ columns mean "
+        f"\"{HIGH_EFFORT_THRESHOLD}+ touches from this person\". A contact worked "
+        f"by two people appears under both, which is why these don't sum to the "
         f"page-level totals above. Catalyst notes are qualitative and are not "
         f"counted as touches anywhere on this page. Departed reps are included "
         f"so historical weeks stay accurate."
