@@ -90,6 +90,45 @@ GCP_PROJECT          = "bi-ntop"
 # Validated empirically — see the dose-response callout in section 1.
 HIGH_EFFORT_THRESHOLD = 3
 
+# The people actually doing outbound, and therefore the denominator for every
+# "per rep" figure on this page.
+#
+# This has to be an explicit list. Salesforce `user.title` is blank for five of
+# the seven, there is no user_role table in the warehouse, and everyone is on an
+# @ntop.com address with a Standard licence — so there is no field that separates
+# the outbound team from the CEO, the General Counsel or a Solutions Engineer who
+# happens to own a couple of logged emails. Counting all task/event owners
+# instead (the original spec's `COUNT(DISTINCT owner_id)`) pulled in 41 people
+# and understated outbound per rep by roughly 3x.
+#
+# Overridable per-session from the sidebar. Anyone outside the roster doing real
+# volume is flagged below rather than silently ignored, so this list failing to
+# keep up with hiring is visible instead of quiet.
+DEFAULT_REP_ROSTER = [
+    "Laurel Berger",
+    "Evan Boyer",
+    "Taha Benhaddou",
+    "Cheyenne Cullen",
+    "Albright Tshisekedi",
+    "Addison Berenzweig",
+    "James Gibbons",
+]
+
+# Outbound touches in-window that make someone worth a second look if they
+# aren't in the selected roster.
+ROSTER_REVIEW_THRESHOLD = 250
+
+# People who clear that threshold but are deliberately off the roster — their day
+# job is something other than outbound. Listed so the staleness check stays quiet
+# about known cases and only speaks up for someone genuinely new; without this it
+# would flag the same four every week and get ignored.
+KNOWN_NON_REPS = {
+    "Neil Brayman":        "Customer Success Manager",
+    "Andrew Hanno":        "VP of Marketing, since departed",
+    "Joel Bejar":          "VP of Sales",
+    "Hemant Bhoosnurmath": "Solutions Engineer",
+}
+
 # Outreach activity only starts being reliably logged in 2026.
 DATA_START    = date(2026, 1, 1)
 DEFAULT_START = date(2026, 1, 1)
@@ -238,6 +277,12 @@ QUADRANT_CELLS = [
 # page (not in an expander) so nobody has to read the code to know what was
 # decided. Add to this list whenever a definition changes.
 METHODOLOGY_NOTES = [
+    ("\"Per rep\" means the outbound team, not everyone in Salesforce",
+     "Every per-rep figure divides by the reps selected in the sidebar, which "
+     "defaults to the seven people actually doing outbound. Counting every "
+     "task and meeting owner instead would pull in 41 people — the CEO, "
+     "finance, legal, solutions engineers and anyone who merely sat in on a "
+     "meeting — and understate outbound per rep by roughly 3x."),
     ("What counts as a touch",
      "Only Outreach-logged activity: outbound emails, calls, and LinkedIn/other "
      "messages. Inbound email replies and non-recurring meetings count as intent "
@@ -526,6 +571,12 @@ def _dates(start: date, end: date) -> list:
     ]
 
 
+def _dates_reps(start: date, end: date, reps: tuple[str, ...]) -> list:
+    return _dates(start, end) + [
+        bigquery.ArrayQueryParameter("reps", "STRING", list(reps)),
+    ]
+
+
 # ── SQL building blocks ───────────────────────────────────────────────────────
 # Ops and system record owners. Deliberately NOT filtered on is_active —
 # departed reps still own historical touches and must stay in trend data.
@@ -537,6 +588,17 @@ ops_users AS (
                   'Service Account Marketo','CS Team')
          OR name LIKE '%Integration%'
          OR name LIKE '%Service Account%')
+)
+"""
+
+# The selected outbound roster, resolved from display names. This is an
+# allowlist, so it also subsumes the ops/system-account exclusion above —
+# a service account can never be on the roster.
+_SEL_USERS = """
+sel_users AS (
+  SELECT id, name FROM `bi-ntop.salesforce.user`
+  WHERE _fivetran_deleted = FALSE
+    AND name IN UNNEST(@reps)
 )
 """
 
@@ -578,10 +640,10 @@ _EVENT_END_BOUND = "LEAST(@end_date, CURRENT_DATE())"
 
 # ── Data loaders ──────────────────────────────────────────────────────────────
 @st.cache_data(ttl=3600)
-def load_weekly_facts(start: date, end: date) -> pd.DataFrame:
+def load_weekly_facts(start: date, end: date, reps: tuple[str, ...]) -> pd.DataFrame:
     """Weekly rep fact table — the primary query for this tab."""
     query = f"""
-    WITH {_OPS_USERS},
+    WITH {_SEL_USERS},
     touches AS (
       SELECT DATE_TRUNC(DATE(t.created_date), WEEK(MONDAY)) AS wk,
              t.owner_id, t.who_id,
@@ -590,7 +652,7 @@ def load_weekly_facts(start: date, end: date) -> pd.DataFrame:
       WHERE t._fivetran_deleted = FALSE          -- TRAP 7
         AND DATE(t.created_date) BETWEEN @start_date AND @end_date
         AND t.who_id IS NOT NULL
-        AND t.owner_id NOT IN (SELECT id FROM ops_users)
+        AND t.owner_id IN (SELECT id FROM sel_users)
       UNION ALL
       SELECT DATE_TRUNC(DATE(e.start_date_time), WEEK(MONDAY)),
              e.owner_id, e.who_id,
@@ -600,7 +662,7 @@ def load_weekly_facts(start: date, end: date) -> pd.DataFrame:
         AND DATE(e.start_date_time)
             BETWEEN @start_date AND {_EVENT_END_BOUND}   -- TRAP 2
         AND e.who_id IS NOT NULL
-        AND e.owner_id NOT IN (SELECT id FROM ops_users)
+        AND e.owner_id IN (SELECT id FROM sel_users)
     )
     SELECT wk,
       COUNT(DISTINCT owner_id) AS active_reps,
@@ -616,21 +678,22 @@ def load_weekly_facts(start: date, end: date) -> pd.DataFrame:
     GROUP BY wk
     ORDER BY wk
     """
-    return _run(query, _dates(start, end))
+    return _run(query, _dates_reps(start, end, reps))
 
 
 @st.cache_data(ttl=3600)
-def load_touches_per_contact(start: date, end: date) -> pd.DataFrame:
+def load_touches_per_contact(start: date, end: date, reps: tuple[str, ...]
+                             ) -> pd.DataFrame:
     """Distribution of outbound touches per contact, bucketed 1 / 2 / 3+."""
     query = f"""
-    WITH {_OPS_USERS},
+    WITH {_SEL_USERS},
     per_contact AS (
       SELECT t.who_id, COUNT(*) AS outbound
       FROM `bi-ntop.salesforce.task` t
       WHERE t._fivetran_deleted = FALSE
         AND DATE(t.created_date) BETWEEN @start_date AND @end_date
         AND t.who_id IS NOT NULL
-        AND t.owner_id NOT IN (SELECT id FROM ops_users)
+        AND t.owner_id IN (SELECT id FROM sel_users)
         AND {_OUTBOUND_SUBJECT_MATCH.replace('subject', 't.subject')}
       GROUP BY 1
     )
@@ -644,14 +707,14 @@ def load_touches_per_contact(start: date, end: date) -> pd.DataFrame:
     GROUP BY 1
     ORDER BY 1
     """
-    return _run(query, _dates(start, end))
+    return _run(query, _dates_reps(start, end, reps))
 
 
 @st.cache_data(ttl=3600)
-def load_quadrant(start: date, end: date) -> pd.DataFrame:
+def load_quadrant(start: date, end: date, reps: tuple[str, ...]) -> pd.DataFrame:
     """Effort x intent quadrant, one row per contact cohort."""
     query = f"""
-    WITH {_OPS_USERS},
+    WITH {_SEL_USERS},
     u AS (
       SELECT t.who_id,
         CASE WHEN t.subject LIKE '[Outreach] [Email] [Out]%'  THEN 'out'
@@ -663,7 +726,7 @@ def load_quadrant(start: date, end: date) -> pd.DataFrame:
       WHERE t._fivetran_deleted = FALSE
         AND DATE(t.created_date) BETWEEN @start_date AND @end_date
         AND t.who_id IS NOT NULL
-        AND t.owner_id NOT IN (SELECT id FROM ops_users)
+        AND t.owner_id IN (SELECT id FROM sel_users)
       UNION ALL
       -- is_child = FALSE: recurring instances are excluded from intent
       SELECT e.who_id, 'meeting'
@@ -673,7 +736,7 @@ def load_quadrant(start: date, end: date) -> pd.DataFrame:
         AND DATE(e.start_date_time)
             BETWEEN @start_date AND {_EVENT_END_BOUND}   -- TRAP 2
         AND e.who_id IS NOT NULL
-        AND e.owner_id NOT IN (SELECT id FROM ops_users)
+        AND e.owner_id IN (SELECT id FROM sel_users)
     ),
     per AS (
       SELECT who_id,
@@ -691,7 +754,7 @@ def load_quadrant(start: date, end: date) -> pd.DataFrame:
     WHERE outbound > 0
     GROUP BY 1,2
     """
-    return _run(query, _dates(start, end))
+    return _run(query, _dates_reps(start, end, reps))
 
 
 @st.cache_data(ttl=3600)
@@ -810,17 +873,60 @@ def load_qualified_opps(start: date, end: date) -> pd.DataFrame:
 
 
 @st.cache_data(ttl=3600)
-def load_per_rep(start: date, end: date) -> pd.DataFrame:
-    """Per-rep drill-down over the selected window."""
+def load_rep_options(start: date, end: date) -> pd.DataFrame:
+    """
+    Everyone who owns a touch in the window, with their outbound volume.
+
+    Populates the sidebar rep picker and drives the roster staleness check, so
+    this one deliberately does NOT apply the roster filter — it uses only the
+    ops/system-account exclusion.
+    """
     query = f"""
     WITH {_OPS_USERS},
+    touches AS (
+      SELECT t.owner_id,
+             IF({_OUTBOUND_SUBJECT_MATCH.replace('subject', 't.subject')}, 1, 0)
+               AS is_outbound
+      FROM `bi-ntop.salesforce.task` t
+      WHERE t._fivetran_deleted = FALSE
+        AND DATE(t.created_date) BETWEEN @start_date AND @end_date
+        AND t.who_id IS NOT NULL
+        AND t.owner_id NOT IN (SELECT id FROM ops_users)
+        AND {_TOUCH_CASE} IS NOT NULL
+      UNION ALL
+      SELECT e.owner_id, 0
+      FROM `bi-ntop.salesforce.event` e
+      WHERE e._fivetran_deleted = FALSE
+        AND DATE(e.start_date_time)
+            BETWEEN @start_date AND {_EVENT_END_BOUND}   -- TRAP 2
+        AND e.who_id IS NOT NULL
+        AND e.owner_id NOT IN (SELECT id FROM ops_users)
+    )
+    SELECT COALESCE(us.name, t.owner_id) AS rep,
+           us.title,
+           SUM(t.is_outbound) AS outbound,
+           COUNT(*) AS all_touches
+    FROM touches t
+    LEFT JOIN `bi-ntop.salesforce.user` us
+      ON us.id = t.owner_id AND us._fivetran_deleted = FALSE
+    GROUP BY 1,2
+    ORDER BY outbound DESC, all_touches DESC
+    """
+    return _run(query, _dates(start, end))
+
+
+@st.cache_data(ttl=3600)
+def load_per_rep(start: date, end: date, reps: tuple[str, ...]) -> pd.DataFrame:
+    """Per-rep drill-down over the selected window."""
+    query = f"""
+    WITH {_SEL_USERS},
     touches AS (
       SELECT t.owner_id, t.who_id, {_TOUCH_CASE} AS touch_type
       FROM `bi-ntop.salesforce.task` t
       WHERE t._fivetran_deleted = FALSE
         AND DATE(t.created_date) BETWEEN @start_date AND @end_date
         AND t.who_id IS NOT NULL
-        AND t.owner_id NOT IN (SELECT id FROM ops_users)
+        AND t.owner_id IN (SELECT id FROM sel_users)
       UNION ALL
       SELECT e.owner_id, e.who_id,
              IF(e.is_child, 'meeting_recurring', 'meeting')
@@ -829,7 +935,7 @@ def load_per_rep(start: date, end: date) -> pd.DataFrame:
         AND DATE(e.start_date_time)
             BETWEEN @start_date AND {_EVENT_END_BOUND}   -- TRAP 2
         AND e.who_id IS NOT NULL
-        AND e.owner_id NOT IN (SELECT id FROM ops_users)
+        AND e.owner_id IN (SELECT id FROM sel_users)
     ),
     clean AS (SELECT * FROM touches WHERE touch_type IS NOT NULL),
     per_rep_contact AS (
@@ -866,7 +972,7 @@ def load_per_rep(start: date, end: date) -> pd.DataFrame:
       ON us.id = a.owner_id AND us._fivetran_deleted = FALSE
     ORDER BY a.outbound DESC
     """
-    return _run(query, _dates(start, end))
+    return _run(query, _dates_reps(start, end, reps))
 
 
 # ── Chart helpers ─────────────────────────────────────────────────────────────
@@ -935,10 +1041,32 @@ with st.sidebar:
         st.error("'From' must be on or before 'To'.")
         st.stop()
 
-    st.caption(
-        "Outreach activity is only reliably logged from January 2026 onward. "
-        "Data is cached for one hour."
+    st.divider()
+
+    # Rep picker. Options are everyone who owns a touch in the window, ordered
+    # by outbound volume, so the people who matter are at the top of the list.
+    rep_opts_df = load_rep_options(start_date, end_date)
+    all_reps = rep_opts_df["rep"].tolist()
+    default_reps = [r for r in DEFAULT_REP_ROSTER if r in all_reps]
+
+    selected_reps = st.multiselect(
+        "Reps",
+        options=all_reps,
+        default=default_reps or all_reps,
+        help=(
+            "Drives every touch metric on this page and the denominator for all "
+            "'per rep' figures. Defaults to the outbound team. Speed to lead and "
+            "qualified opportunities are not filtered — see their panels."
+        ),
     )
+
+    st.caption(
+        f"{len(selected_reps)} of {len(all_reps)} touch owners selected. "
+        f"Outreach activity is only reliably logged from January 2026 onward. "
+        f"Data is cached for one hour."
+    )
+
+REPS = tuple(selected_reps)
 
 
 # ── Methodology notes ─────────────────────────────────────────────────────────
@@ -953,6 +1081,49 @@ st.markdown(
 )
 
 
+# ── Roster staleness check ────────────────────────────────────────────────────
+# An explicit roster goes stale the moment someone is hired. Rather than let that
+# happen quietly, flag anyone outside the selection doing real outbound volume.
+_outside = rep_opts_df[
+    (~rep_opts_df["rep"].isin(selected_reps))
+    & (rep_opts_df["outbound"] >= ROSTER_REVIEW_THRESHOLD)
+]
+_unrecognised = _outside[~_outside["rep"].isin(KNOWN_NON_REPS)]
+if not _unrecognised.empty:
+    _who = ", ".join(
+        f"{r.rep} ({int(r.outbound):,} outbound)"
+        for r in _unrecognised.itertuples()
+    )
+    st.warning(
+        f"**{len(_unrecognised)} "
+        f"{'person' if len(_unrecognised) == 1 else 'people'} outside the "
+        f"selected reps logged {ROSTER_REVIEW_THRESHOLD}+ outbound touches in "
+        f"this window:** {_who}. If they belong on the outbound team, add them "
+        f"in the sidebar — their volume is excluded from every figure below. "
+        f"If they don't, add them to `KNOWN_NON_REPS` in the page source to stop "
+        f"this notice."
+    )
+
+# Known non-reps with real volume, surfaced quietly rather than hidden — the
+# effort is real work, it just isn't outbound-team capacity.
+_known_excluded = _outside[_outside["rep"].isin(KNOWN_NON_REPS)]
+if not _known_excluded.empty:
+    _known_txt = " · ".join(
+        f"{r.rep} ({KNOWN_NON_REPS[r.rep]}, {int(r.outbound):,})"
+        for r in _known_excluded.itertuples()
+    )
+    st.caption(
+        f":gray[Also logging outbound but excluded as non-reps: {_known_txt}. "
+        f"Counted nowhere on this page.]"
+    )
+
+if not REPS:
+    st.info(
+        "No reps selected. Pick at least one in the sidebar to see the touch "
+        "metrics. Speed to lead and qualified opportunities are unaffected."
+    )
+
+
 # ── 1. Headline — the dose-response ───────────────────────────────────────────
 st.divider()
 st.subheader("The 3-touch threshold")
@@ -962,7 +1133,7 @@ st.caption(
 )
 
 with st.spinner("Loading touch data…"):
-    quad_df = load_quadrant(start_date, end_date)
+    quad_df = load_quadrant(start_date, end_date, REPS) if REPS else pd.DataFrame()
 
 if quad_df.empty:
     st.info("No touch data in the selected range.")
@@ -1010,8 +1181,9 @@ st.markdown(
 )
 st.caption(
     f"Across {total_contacts:,} contacts who received at least one outbound "
-    f"touch in the selected window. A contact is counted as engaged if they "
-    f"replied by email or took a non-recurring meeting."
+    f"touch from the {len(REPS)} selected reps in this window. A contact is "
+    f"counted as engaged if they replied by email or took a non-recurring "
+    f"meeting."
 )
 
 
@@ -1021,7 +1193,9 @@ st.subheader("Weekly effort trend")
 st.caption(METRIC_COPY["outbound_per_rep"]["why"])
 
 with st.spinner("Loading weekly trend…"):
-    wk_df = load_weekly_facts(start_date, end_date)
+    wk_df = (
+        load_weekly_facts(start_date, end_date, REPS) if REPS else pd.DataFrame()
+    )
 
 wk_df, _has_current_week = _prep_weeks(wk_df, start_date, end_date, today)
 
@@ -1046,11 +1220,21 @@ else:
         f"{int(latest['contacts_touched']):,}",
         help=METRIC_COPY["contacts_touched"]["what"],
     )
-    m3.metric("Active reps", f"{int(latest['active_reps'])}")
+    m3.metric(
+        "Reps logging touches",
+        f"{int(latest['active_reps'])} of {len(REPS)}",
+        help=(
+            "Selected reps who logged at least one touch that week, out of the "
+            "reps chosen in the sidebar. This is the denominator for outbound "
+            "per rep."
+        ),
+    )
     m4.metric("Meetings booked", f"{int(latest['meetings'])}")
     st.caption(
         f"Latest complete week beginning "
-        f"{pd.to_datetime(latest['wk']).strftime('%b %d, %Y')}."
+        f"{pd.to_datetime(latest['wk']).strftime('%b %d, %Y')}. "
+        f"Per-rep figures divide by the reps who logged touches that week, not "
+        f"by everyone who owns a record in Salesforce."
     )
 
     fig1 = go.Figure()
@@ -1066,10 +1250,10 @@ else:
         hovertemplate="%{x|%b %d}: %{y:.1f} per rep<extra></extra>",
     ))
     fig1.add_trace(go.Scatter(
-        x=wk_df["wk"], y=wk_df["active_reps"], name="Active reps",
+        x=wk_df["wk"], y=wk_df["active_reps"], name="Reps logging touches",
         mode="lines", yaxis="y2",
         line=dict(color=_C["gray_mid"], width=1.5, dash="dot"),
-        hovertemplate="%{x|%b %d}: %{y:,d} reps<extra></extra>",
+        hovertemplate="%{x|%b %d}: %{y:,d} reps logged touches<extra></extra>",
     ))
     _base_layout(fig1, "Outbound volume and intensity per week", "Weekly")
     fig1.update_layout(
@@ -1111,7 +1295,10 @@ st.subheader("Touches per contact")
 st.caption(METRIC_COPY["touches_per_contact"]["why"])
 
 with st.spinner("Loading touch distribution…"):
-    dist_df = load_touches_per_contact(start_date, end_date)
+    dist_df = (
+        load_touches_per_contact(start_date, end_date, REPS)
+        if REPS else pd.DataFrame()
+    )
 
 if dist_df.empty:
     st.info("No outbound touch data in the selected range.")
@@ -1196,6 +1383,11 @@ else:
 st.divider()
 st.subheader("Speed to lead — Outreach-tracked subset only")
 st.caption(METRIC_COPY["speed_to_lead"]["why"])
+st.caption(
+    ":gray[Not affected by the rep filter — the first response to an inbound "
+    "demo request can come from anyone, so narrowing to a few reps would "
+    "misread slow follow-up where it was simply someone else who replied.]"
+)
 
 with st.spinner("Loading speed to lead…"):
     s2l_df = load_speed_to_lead(start_date, end_date)
@@ -1272,6 +1464,11 @@ else:
 st.divider()
 st.subheader("Qualified opportunities per rep")
 st.caption(METRIC_COPY["qualified_opps"]["why"])
+st.caption(
+    ":gray[Not affected by the rep filter — opportunities are owned by account "
+    "executives, a different group from the outbound team above. \"Per rep\" "
+    "here means per opportunity owner.]"
+)
 
 with st.spinner("Loading qualified opportunities…"):
     opp_df = load_qualified_opps(start_date, end_date)
@@ -1340,7 +1537,7 @@ st.caption(
 )
 
 with st.spinner("Loading per-rep detail…"):
-    rep_df = load_per_rep(start_date, end_date)
+    rep_df = load_per_rep(start_date, end_date, REPS) if REPS else pd.DataFrame()
 
 if rep_df.empty:
     st.info("No rep activity in the selected range.")

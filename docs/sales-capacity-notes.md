@@ -52,7 +52,29 @@ Case-insensitive matching on the call bucket is required — direction markers a
 
 **Thresholds.** High effort = 3+ outbound touches to a contact (Jai's benchmark). High intent = at least one `email_in` reply or one non-recurring meeting.
 
-**Rep roster.** Excludes ops and system owners by name: `Revenue Operations`, `Hubspot Integration`, `Service Account Marketo`, `CS Team`, plus anything matching `%Integration%` or `%Service Account%`. Deliberately **not** filtered on `is_active` — departed reps still own historical touches, and excluding them would make past weeks look artificially quiet.
+**Rep roster.** Every per-rep figure divides by the reps selected in the sidebar, defaulting to `DEFAULT_REP_ROSTER` — the seven people actually doing outbound:
+
+| Rep | Outbound, 2026 YTD |
+|---|---|
+| Laurel Berger | 2,859 |
+| Evan Boyer | 2,739 |
+| Taha Benhaddou | 1,653 |
+| Cheyenne Cullen | 1,515 |
+| Albright Tshisekedi | 1,235 |
+| Addison Berenzweig | 854 |
+| James Gibbons | 259 |
+
+This has to be an explicit list. `user.title` is blank for five of the seven, there is no `user_role` table in the warehouse, and everyone is on an `@ntop.com` address with a Standard licence — so no field separates the outbound team from the CEO or a Solutions Engineer who owns a couple of logged emails.
+
+The original spec's `COUNT(DISTINCT owner_id)` counted **all 41 touch owners** — including the CEO (108 outbound), VP Finance (11), General Counsel (26), Director of Accounting (13), plus 10 people with zero outbound who appear only because they attended a meeting. That understated outbound per rep by roughly 3x: 14.2 for the week of Jul 20 against 27.3 on the correct denominator.
+
+`KNOWN_NON_REPS` holds four people who clear the 250-outbound review threshold but are deliberately off the roster (Neil Brayman, CSM; Andrew Hanno, VP Marketing, departed; Joel Bejar, VP Sales; Hemant Bhoosnurmath, Solutions Engineer). They're listed so the staleness check below stays quiet about known cases, and surfaced in a caption so their volume isn't hidden.
+
+**Roster staleness check.** An explicit list goes stale the moment someone is hired, so the page warns when anyone outside the selection logs `ROSTER_REVIEW_THRESHOLD` (250) or more outbound touches in the window and isn't in `KNOWN_NON_REPS`. Add them to the roster or to the known-non-reps list; don't ignore it.
+
+Ops and system owners are excluded everywhere: `Revenue Operations`, `Hubspot Integration`, `Service Account Marketo`, `CS Team`, plus anything matching `%Integration%` or `%Service Account%`. The roster is an allowlist, so it subsumes that exclusion — a service account can never be on it. Deliberately **not** filtered on `is_active` — departed reps still own historical touches, and excluding them would make past weeks look artificially quiet.
+
+**What the rep filter reaches.** Weekly trend, touches per contact, effort vs intent, and the per-rep table. **Not** speed to lead (the first response to an inbound demo can come from anyone, so narrowing would misread slow follow-up where someone else simply replied) and **not** qualified opportunities (owned by AEs, a different population — "per rep" there means per opportunity owner).
 
 ---
 
@@ -69,6 +91,8 @@ These are surfaced in the UI as well, in the "How these numbers are built" card 
 4. **The speed-to-lead headline uses `GROUP BY ROLLUP`.** This gives a true median across the whole window rather than an average of monthly medians.
 
 5. **Per-rep benchmark columns are per rep, not per contact.** A contact worked by two reps counts under both, so the per-rep table doesn't sum to page-level totals. Called out in the table caption.
+
+6. **"Per rep" divides by the outbound roster, not by every task owner.** Added after the first build: the original `COUNT(DISTINCT owner_id)` denominator pulled in 41 people and understated outbound per rep ~3x. See the rep roster section above. A sidebar rep picker overrides the default per session.
 
 ---
 
@@ -89,6 +113,22 @@ Every one of these was hit during the original analysis. Each is handled in code
 ## Acceptance numbers
 
 Verified 2026-07-30 with `From = 2026-01-01`.
+
+### On the default 7-rep roster — what the page actually shows
+
+| Figure | Value |
+|---|---|
+| Contacts with ≥1 outbound touch | 2,094 |
+| 3+ touches → replied or met | **52.6%** |
+| 1–2 touches → replied or met | **34.1%** |
+| Gap | +18.6 pts |
+| Contacts at 3+ touches | 59.8% |
+| Outbound per rep, week of Jul 20 | 27.3 |
+| Outbound per rep, trailing 9 weeks | 27.3–48.5 |
+
+The ≥3 benchmark still validates clearly on the correct denominator, though the gap narrows from +24.5 to +18.6 points. That's expected: contacts touched by both a roster rep and a non-rep now count only the roster touches, so some engaged contacts move from the 3+ bucket to the 1–2 bucket while keeping the intent they earned.
+
+### On all 41 touch owners — the original spec's basis, kept as a regression check
 
 **Quadrant** — 2,429 contacts with ≥1 outbound touch (spec said 2,428):
 
